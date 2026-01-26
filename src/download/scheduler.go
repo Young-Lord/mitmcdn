@@ -366,7 +366,7 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 		}
 
 		// Remove "Download failed: " prefix if present for cleaner error message
-		if after, ok :=strings.CutPrefix(errorMsg, "Download failed: "); ok  {
+		if after, ok := strings.CutPrefix(errorMsg, "Download failed: "); ok {
 			errorMsg = after
 		}
 
@@ -398,13 +398,11 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 	}
 
 	// Open file for reading existing content first
-	var f *os.File
 	currentSize := int64(0)
 	if f, err := os.Open(file.SavedPath); err == nil {
 		info, _ := f.Stat()
 		currentSize = info.Size()
 		f.Close() // Close and reopen later if needed
-		f = nil
 	}
 
 	// Wait for task to be ready (with timeout)
@@ -414,13 +412,10 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 		select {
 		case <-timeout:
 			// Timeout - check if we have any content to serve
-			if f != nil {
-				info, _ := f.Stat()
-				if info.Size() > 0 {
-					// We have some content, serve it even if download hasn't started
-					ready = true
-					break
-				}
+			if currentSize > 0 {
+				// We have some content, serve it even if download hasn't started
+				ready = true
+				break
 			}
 			// No content, return error
 			return fmt.Errorf("timeout waiting for download to start")
@@ -470,11 +465,13 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 	}
 
 	// Stream existing content first (if any)
-	if currentSize > 0 && f != nil {
-		io.Copy(w, f)
-		f.Close()
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
+	if currentSize > 0 {
+		if f, err := os.Open(file.SavedPath); err == nil {
+			io.Copy(w, f)
+			f.Close()
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
 		}
 	}
 

@@ -4,12 +4,9 @@ mitmcdn
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
-
-# Output of the go coverage tool
 *.out
+/target
 
 # Dependency directories
 vendor/
@@ -24,7 +21,6 @@ go.work
 
 # Cache directory
 data/
-/var/lib/mitmcdn/
 
 # Configuration (keep example)
 config.toml
@@ -42,3 +38,5 @@ config.toml
 # OS
 .DS_Store
 Thumbs.db
+
+mitmcdn.log

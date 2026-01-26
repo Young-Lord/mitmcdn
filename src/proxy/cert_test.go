@@ -26,7 +26,7 @@ func TestGenerateRootCA(t *testing.T) {
 		t.Error("Certificate should be marked as CA")
 	}
 
-	if cert.Subject.Organization == nil || len(cert.Subject.Organization) == 0 {
+	if len(cert.Subject.Organization) == 0 {
 		t.Error("Certificate should have organization")
 	}
 }
@@ -35,7 +35,7 @@ func TestLoadOrCreateRootCA(t *testing.T) {
 	// Use a temporary directory for testing
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
-	
+
 	// Temporarily set HOME to tmpDir
 	os.Setenv("HOME", tmpDir)
 	defer func() {
@@ -84,7 +84,7 @@ func TestGenerateCertificate(t *testing.T) {
 	// Use a temporary directory for testing
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
-	
+
 	os.Setenv("HOME", tmpDir)
 	defer func() {
 		if originalHome != "" {
@@ -130,7 +130,7 @@ func TestGenerateCertificateMultipleHosts(t *testing.T) {
 	// Use a temporary directory for testing
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
-	
+
 	os.Setenv("HOME", tmpDir)
 	defer func() {
 		if originalHome != "" {
