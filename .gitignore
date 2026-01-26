@@ -1,0 +1,44 @@
+# Binaries
+mitmcdn
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Cache directory
+data/
+/var/lib/mitmcdn/
+
+# Configuration (keep example)
+config.toml
+
+# Certificates
+.mitmproxy/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
