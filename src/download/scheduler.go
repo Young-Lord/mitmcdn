@@ -6,7 +6,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -25,6 +28,7 @@ type Scheduler struct {
 	mu           sync.RWMutex
 	tasks        map[string]*Task // fileHash -> task
 	priorityChan chan *Task       // Priority queue
+	ytDLPCommand []string
 }
 
 type Task struct {
@@ -40,6 +44,7 @@ type Task struct {
 	resumeChan chan struct{}
 	file       *database.File
 	dataChan   chan []byte // Channel for streaming data to clients
+	closeOnce  sync.Once
 	streamMu   sync.RWMutex
 	streamers  []io.Writer // Active streamers (clients receiving data)
 }
@@ -73,7 +78,22 @@ func NewSchedulerWithClient(cacheManager *cache.Manager, db *gorm.DB, upstreamPr
 		httpClient:   httpClient,
 		tasks:        make(map[string]*Task),
 		priorityChan: make(chan *Task, 100),
+		ytDLPCommand: []string{"yt-dlp"},
 	}, nil
+}
+
+func (s *Scheduler) ConfigureYTDLPCommand(command []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.ytDLPCommand = append([]string(nil), command...)
+}
+
+func (s *Scheduler) getYTDLPCommand() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return append([]string(nil), s.ytDLPCommand...)
 }
 
 // GetActiveTaskCount returns the number of active download tasks
@@ -83,7 +103,10 @@ func (s *Scheduler) GetActiveTaskCount() int {
 
 	count := 0
 	for _, task := range s.tasks {
-		if task.Status == "downloading" {
+		task.mu.Lock()
+		status := task.Status
+		task.mu.Unlock()
+		if status == "downloading" {
 			count++
 		}
 	}
@@ -93,22 +116,29 @@ func (s *Scheduler) GetActiveTaskCount() int {
 // StartDownload starts or resumes downloading a file
 func (s *Scheduler) StartDownload(file *database.File, url, cookie string, priority int) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	task, exists := s.tasks[file.FileHash]
+	if exists {
+		s.mu.Unlock()
 
-	// Check if task already exists
-	if task, exists := s.tasks[file.FileHash]; exists {
-		if task.Status == "downloading" {
-			return nil // Already downloading
-		}
-		// Resume paused task
+		task.mu.Lock()
+		status := task.Status
 		task.Priority = priority
-		task.resumeChan <- struct{}{}
+		task.mu.Unlock()
+
+		if status == "downloading" || status == "pending" || status == "complete" {
+			return nil // Already active or finished
+		}
+
+		if status == "paused" {
+			// Resume paused task
+			task.resumeChan <- struct{}{}
+		}
 		return nil
 	}
 
 	// Create new task
 	ctx, cancel := context.WithCancel(context.Background())
-	task := &Task{
+	task = &Task{
 		FileHash:   file.FileHash,
 		URL:        url,
 		Cookie:     cookie,
@@ -124,6 +154,7 @@ func (s *Scheduler) StartDownload(file *database.File, url, cookie string, prior
 	}
 
 	s.tasks[file.FileHash] = task
+	s.mu.Unlock()
 
 	// Start download in goroutine
 	go func() {
@@ -143,7 +174,11 @@ func (s *Scheduler) PauseLowPriorityTasks(minPriority int) {
 	s.mu.RLock()
 	tasks := make([]*Task, 0)
 	for _, task := range s.tasks {
-		if task.Status == "downloading" && task.Priority < minPriority {
+		task.mu.Lock()
+		shouldPause := task.Status == "downloading" && task.Priority < minPriority
+		task.mu.Unlock()
+
+		if shouldPause {
 			tasks = append(tasks, task)
 		}
 	}
@@ -174,6 +209,11 @@ func (s *Scheduler) downloadTask(task *Task) {
 	s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(map[string]interface{}{
 		"download_status": "downloading",
 	})
+
+	if videoID, ok := extractYTDLPVideoID(task.URL); ok {
+		s.downloadYTDLPTask(task, videoID)
+		return
+	}
 
 	// Check if file already exists and get current size
 	fileInfo, err := os.Stat(task.file.SavedPath)
@@ -230,13 +270,21 @@ func (s *Scheduler) downloadTask(task *Task) {
 		totalSize = startOffset + resp.ContentLength
 	}
 
-	// Update file size and content type in database
+	// Update file size and content type in database and memory
 	updates := map[string]interface{}{}
 	if totalSize > startOffset {
 		updates["file_size"] = totalSize
+		// Update in-memory copy for immediate access
+		task.mu.Lock()
+		task.file.FileSize = totalSize
+		task.mu.Unlock()
 	}
 	if contentType != "" {
 		updates["content_type"] = contentType
+		// Update in-memory copy for immediate access
+		task.mu.Lock()
+		task.file.ContentType = contentType
+		task.mu.Unlock()
 	}
 	if len(updates) > 0 {
 		s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(updates)
@@ -299,7 +347,7 @@ func (s *Scheduler) downloadTask(task *Task) {
 				task.mu.Unlock()
 
 				// Close data channel to signal streamers
-				close(task.dataChan)
+				s.closeTaskDataChan(task)
 				return
 			}
 			if err != nil {
@@ -310,10 +358,90 @@ func (s *Scheduler) downloadTask(task *Task) {
 	}
 }
 
+func extractYTDLPVideoID(rawURL string) (string, bool) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme != "yt-dlp" {
+		return "", false
+	}
+
+	videoID := parsed.Host
+	if videoID == "" {
+		videoID = strings.TrimPrefix(parsed.Path, "/")
+	}
+	videoID = strings.TrimSpace(videoID)
+	if videoID == "" {
+		return "", false
+	}
+
+	return videoID, true
+}
+
+func (s *Scheduler) downloadYTDLPTask(task *Task, videoID string) {
+	command := s.getYTDLPCommand()
+	if len(command) == 0 {
+		s.handleDownloadError(task, fmt.Errorf("yt-dlp command is empty"))
+		return
+	}
+
+	if err := os.MkdirAll(filepath.Dir(task.file.SavedPath), 0755); err != nil {
+		s.handleDownloadError(task, err)
+		return
+	}
+
+	tempPath := task.file.SavedPath + ".part"
+	_ = os.Remove(tempPath)
+
+	args := append([]string{}, command[1:]...)
+	sourceURL := fmt.Sprintf("https://www.youtube.com/watch?v=%s", videoID)
+	args = append(args,
+		"--no-part",
+		"--no-continue",
+		"--no-playlist",
+		"-o", tempPath,
+		sourceURL,
+	)
+
+	cmd := exec.CommandContext(task.ctx, command[0], args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		s.handleDownloadError(task, fmt.Errorf("yt-dlp failed: %w: %s", err, strings.TrimSpace(string(output))))
+		return
+	}
+
+	if err := os.Rename(tempPath, task.file.SavedPath); err != nil {
+		s.handleDownloadError(task, fmt.Errorf("failed to finalize yt-dlp output: %w", err))
+		return
+	}
+
+	info, err := os.Stat(task.file.SavedPath)
+	if err != nil {
+		s.handleDownloadError(task, err)
+		return
+	}
+
+	now := time.Now()
+	s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(map[string]interface{}{
+		"download_status":  "complete",
+		"downloaded_bytes": info.Size(),
+		"file_size":        info.Size(),
+		"content_type":     "video/mp4",
+		"completed_at":     &now,
+	})
+
+	task.mu.Lock()
+	task.Status = "complete"
+	task.file.ContentType = "video/mp4"
+	task.file.FileSize = info.Size()
+	task.mu.Unlock()
+
+	s.closeTaskDataChan(task)
+}
+
 func (s *Scheduler) handleDownloadError(task *Task, err error) {
 	task.mu.Lock()
 	task.Status = "failed"
 	task.mu.Unlock()
+	s.closeTaskDataChan(task)
 
 	s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Update("download_status", "failed")
 
@@ -330,6 +458,12 @@ func (s *Scheduler) handleDownloadError(task *Task, err error) {
 	})
 }
 
+func (s *Scheduler) closeTaskDataChan(task *Task) {
+	task.closeOnce.Do(func() {
+		close(task.dataChan)
+	})
+}
+
 // StreamFile streams a file to client while downloading (if not complete)
 // Implements "stream tapping" - downloads from upstream while streaming to client
 func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *http.Request) error {
@@ -341,45 +475,22 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 
 	// If file download failed, return error to client
 	if file.DownloadStatus == "failed" {
-		// Get error message from logs
-		var logEntry database.Log
-		s.db.Where("file_hash = ? AND level = ?", file.FileHash, "error").
-			Order("created_at DESC").
-			First(&logEntry)
-
-		// Extract HTTP status code from error message if available
-		var statusCode int = http.StatusBadGateway
-		var errorMsg string = "Download failed"
-
-		if logEntry.Message != "" {
-			errorMsg = logEntry.Message
-			// Try to extract status code from message like "Download failed: unexpected status code: 404"
-			if strings.Contains(logEntry.Message, "unexpected status code:") {
-				var code int
-				// Try different patterns
-				if _, err := fmt.Sscanf(logEntry.Message, "Download failed: unexpected status code: %d", &code); err == nil {
-					statusCode = code
-				} else if _, err := fmt.Sscanf(logEntry.Message, "unexpected status code: %d", &code); err == nil {
-					statusCode = code
-				}
-			}
-		}
-
-		// Remove "Download failed: " prefix if present for cleaner error message
-		if after, ok := strings.CutPrefix(errorMsg, "Download failed: "); ok {
-			errorMsg = after
-		}
-
-		http.Error(w, errorMsg, statusCode)
-		return fmt.Errorf("file download failed: %s", errorMsg)
+		return s.writeDownloadError(w, file.FileHash)
 	}
 
 	// Get or start download task
 	// Check if task exists (without holding lock during StartDownload to avoid deadlock)
-	s.mu.Lock()
+	s.mu.RLock()
 	task, exists := s.tasks[file.FileHash]
-	needsStart := !exists || (task != nil && task.Status != "downloading" && task.Status != "complete")
-	s.mu.Unlock()
+	s.mu.RUnlock()
+
+	needsStart := !exists
+	if exists && task != nil {
+		task.mu.Lock()
+		status := task.Status
+		task.mu.Unlock()
+		needsStart = status != "downloading" && status != "complete"
+	}
 
 	if needsStart {
 		// Start download with high priority (don't hold lock to avoid deadlock)
@@ -388,9 +499,9 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 			return fmt.Errorf("failed to start download: %w", err)
 		}
 		// Get the task we just created
-		s.mu.Lock()
+		s.mu.RLock()
 		task = s.tasks[file.FileHash]
-		s.mu.Unlock()
+		s.mu.RUnlock()
 
 		if task == nil {
 			return fmt.Errorf("task not found after creation")
@@ -423,6 +534,13 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 			task.mu.Lock()
 			status := task.Status
 			task.mu.Unlock()
+			if status == "failed" {
+				if currentSize == 0 {
+					return s.writeDownloadError(w, file.FileHash)
+				}
+				ready = true
+				break
+			}
 			if status == "downloading" || status == "complete" {
 				ready = true
 				break
@@ -431,18 +549,34 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 		}
 	}
 
-	// Wait a bit for ContentType and FileSize to be set by download task
-	for i := 0; i < 20; i++ {
-		// Reload file from database to get updated info
-		var updatedFile database.File
-		if err := s.db.First(&updatedFile, "file_hash = ?", file.FileHash).Error; err == nil {
-			file.ContentType = updatedFile.ContentType
-			file.FileSize = updatedFile.FileSize
-			if file.ContentType != "" {
-				break
-			}
+	// Wait for ContentType and FileSize to be set by download task
+	// Use in-memory task.file instead of polling database
+	maxWait := 20
+	for i := 0; i < maxWait; i++ {
+		task.mu.Lock()
+		status := task.Status
+		contentType := task.file.ContentType
+		fileSize := task.file.FileSize
+		task.mu.Unlock()
+
+		if status == "failed" && currentSize == 0 {
+			return s.writeDownloadError(w, file.FileHash)
+		}
+
+		if contentType != "" {
+			// Update the file parameter with values from task
+			file.ContentType = contentType
+			file.FileSize = fileSize
+			break
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+
+	task.mu.Lock()
+	status := task.Status
+	task.mu.Unlock()
+	if status == "failed" && currentSize == 0 {
+		return s.writeDownloadError(w, file.FileHash)
 	}
 
 	// Set headers for streaming
@@ -497,4 +631,38 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 			}
 		}
 	}
+}
+
+func (s *Scheduler) writeDownloadError(w http.ResponseWriter, fileHash string) error {
+	// Get error message from logs
+	var logEntry database.Log
+	s.db.Where("file_hash = ? AND level = ?", fileHash, "error").
+		Order("created_at DESC").
+		First(&logEntry)
+
+	// Extract HTTP status code from error message if available
+	statusCode := http.StatusBadGateway
+	errorMsg := "Download failed"
+
+	if logEntry.Message != "" {
+		errorMsg = logEntry.Message
+		// Try to extract status code from message like "Download failed: unexpected status code: 404"
+		if strings.Contains(logEntry.Message, "unexpected status code:") {
+			var code int
+			// Try different patterns
+			if _, err := fmt.Sscanf(logEntry.Message, "Download failed: unexpected status code: %d", &code); err == nil {
+				statusCode = code
+			} else if _, err := fmt.Sscanf(logEntry.Message, "unexpected status code: %d", &code); err == nil {
+				statusCode = code
+			}
+		}
+	}
+
+	// Remove "Download failed: " prefix if present for cleaner error message
+	if after, ok := strings.CutPrefix(errorMsg, "Download failed: "); ok {
+		errorMsg = after
+	}
+
+	http.Error(w, errorMsg, statusCode)
+	return fmt.Errorf("file download failed: %s", errorMsg)
 }

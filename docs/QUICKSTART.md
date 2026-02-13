@@ -113,12 +113,12 @@ upstream_proxy = "socks5://127.0.0.1:1080"
 
 ```toml
 [[cdn_rules]]
-domain = "cdn1.example.com"
+domain = "cdn1.httpbin.org"
 match_pattern = "\\.mp4$"
 dedup_strategy = "filename_only"
 
 [[cdn_rules]]
-domain = "cdn2.example.com"
+domain = "cdn2.httpbin.org"
 match_pattern = "\\.(exe|zip)$"
 dedup_strategy = "full_url"
 ```

@@ -60,7 +60,7 @@ func TestStatusHandlerAPI(t *testing.T) {
 	// Create a test file
 	file := database.File{
 		FileHash:       "test-hash",
-		OriginalURL:    "https://example.com/test.mp4",
+		OriginalURL:    "https://httpbin.org/get?a=1",
 		Filename:       "test.mp4",
 		FileSize:       1024 * 1024,
 		SavedPath:      "/tmp/test.mp4",
@@ -99,7 +99,7 @@ func TestStatusHandlerPage(t *testing.T) {
 	// Create a test file
 	file := database.File{
 		FileHash:       "test-hash",
-		OriginalURL:    "https://example.com/test.mp4",
+		OriginalURL:    "https://httpbin.org/get?a=1",
 		Filename:       "test.mp4",
 		FileSize:       1024 * 1024,
 		SavedPath:      "/tmp/test.mp4",

@@ -12,6 +12,7 @@ import (
 	"mitmcdn/src/cache"
 	"mitmcdn/src/config"
 	"mitmcdn/src/download"
+	"mitmcdn/src/htmlplugin"
 )
 
 type HTTPReverseProxy struct {
@@ -19,14 +20,16 @@ type HTTPReverseProxy struct {
 	cacheManager  *cache.Manager
 	downloadSched *download.Scheduler
 	mitmProxy     *MITMProxy
+	htmlPlugins   *htmlplugin.Manager
 }
 
-func NewHTTPReverseProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, mitm *MITMProxy) *HTTPReverseProxy {
+func NewHTTPReverseProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, mitm *MITMProxy, htmlPlugins *htmlplugin.Manager) *HTTPReverseProxy {
 	return &HTTPReverseProxy{
 		config:        cfg,
 		cacheManager:  cacheMgr,
 		downloadSched: sched,
 		mitmProxy:     mitm,
+		htmlPlugins:   htmlPlugins,
 	}
 }
 
@@ -196,6 +199,13 @@ func (p *HTTPReverseProxy) forwardRequest(w http.ResponseWriter, r *http.Request
 			req.URL.RawQuery = targetURL.RawQuery // Preserve query parameters from target URL
 			req.URL.Fragment = targetURL.Fragment
 			req.Host = targetURL.Host
+			req.Header.Del("Accept-Encoding")
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			if p.htmlPlugins == nil {
+				return nil
+			}
+			return p.htmlPlugins.ModifyResponse(resp)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logErrorWithStack(err, "HTTP reverse proxy error: %s %s", r.Method, r.URL.String())

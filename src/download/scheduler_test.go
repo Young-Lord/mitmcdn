@@ -20,12 +20,12 @@ func setupTestScheduler(t *testing.T) (*Scheduler, *gorm.DB, *cache.Manager) {
 		t.Fatalf("Failed to create temp DB: %v", err)
 	}
 	tmpDB.Close()
-	
+
 	// Ensure file is writable
 	if err := os.Chmod(tmpDB.Name(), 0644); err != nil {
 		t.Logf("Warning: failed to set file permissions: %v", err)
 	}
-	
+
 	t.Cleanup(func() {
 		os.Remove(tmpDB.Name())
 	})
@@ -54,9 +54,9 @@ func setupTestScheduler(t *testing.T) (*Scheduler, *gorm.DB, *cache.Manager) {
 // createTestHTTPClient creates an HTTP client that trusts all certificates (for testing only)
 func createTestHTTPClient() *http.Client {
 	transport := &http.Transport{
-		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
-		DisableCompression:  false,
+		MaxIdleConns:       100,
+		IdleConnTimeout:    90 * time.Second,
+		DisableCompression: false,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true, // Trust all certificates in tests
 		},
@@ -87,16 +87,16 @@ func TestNewScheduler(t *testing.T) {
 func TestStartDownload(t *testing.T) {
 	sched, _, cacheMgr := setupTestScheduler(t)
 
-	// Use a real URL that exists (example.com root works)
-	testURL := "https://example.com/"
-	
+	// Use a real URL that exists (httpbin.org works)
+	testURL := "https://httpbin.org/get?a=1"
+
 	// Create a test file using cache manager to ensure proper setup
 	file, err := cacheMgr.GetOrCreateFile(testURL, "", "index.html", "filename_only")
 	if err != nil {
 		t.Fatalf("Failed to get or create file: %v", err)
 	}
 
-	// Start download - this should work with example.com
+	// Start download - this should work with httpbin.org
 	// Use goroutine to avoid blocking
 	go sched.StartDownload(file, testURL, "", 100)
 
@@ -118,17 +118,20 @@ func TestStartDownload(t *testing.T) {
 		return
 	}
 
-	if task.Priority != 100 {
-		t.Errorf("Task priority = %d, want 100", task.Priority)
+	task.mu.Lock()
+	priority := task.Priority
+	task.mu.Unlock()
+	if priority != 100 {
+		t.Errorf("Task priority = %d, want 100", priority)
 	}
 }
 
 func TestPauseLowPriorityTasks(t *testing.T) {
 	sched, _, cacheMgr := setupTestScheduler(t)
 
-	// Use real URLs (example.com root works better than index.html)
-	testURL1 := "https://example.com/"
-	testURL2 := "https://www.example.com/"
+	// Use real URLs (httpbin.org works better than index.html)
+	testURL1 := "https://httpbin.org/get?a=1"
+	testURL2 := "https://httpbin.org/get?b=2"
 
 	// Create files using cache manager
 	file1, err := cacheMgr.GetOrCreateFile(testURL1, "", "index.html", "full_url")
@@ -160,11 +163,16 @@ func TestPauseLowPriorityTasks(t *testing.T) {
 	for _, file := range files {
 		if task, exists := sched.tasks[file.FileHash]; exists {
 			taskCount++
-			if task.Priority < 50 {
+			task.mu.Lock()
+			priority := task.Priority
+			status := task.Status
+			task.mu.Unlock()
+
+			if priority < 50 {
 				// Task should be paused or at least exist
-				if task.Status != "paused" && task.Status != "downloading" && task.Status != "pending" {
-					t.Logf("Task %s with priority %d has unexpected status: %s", 
-						file.FileHash, task.Priority, task.Status)
+				if status != "paused" && status != "downloading" && status != "pending" {
+					t.Logf("Task %s with priority %d has unexpected status: %s",
+						file.FileHash, priority, status)
 				}
 			}
 		}
@@ -179,8 +187,8 @@ func TestPauseLowPriorityTasks(t *testing.T) {
 func TestSchedulerTaskManagement(t *testing.T) {
 	sched, _, cacheMgr := setupTestScheduler(t)
 
-	testURL := "https://example.com/index.html"
-	
+	testURL := "https://httpbin.org/get?a=1"
+
 	// Create file using cache manager
 	file, err := cacheMgr.GetOrCreateFile(testURL, "", "index.html", "filename_only")
 	if err != nil {
@@ -219,5 +227,48 @@ func TestSchedulerTaskManagement(t *testing.T) {
 
 	if task != task2 {
 		t.Error("Should reuse same task")
+	}
+}
+
+func TestExtractYTDLPVideoID(t *testing.T) {
+	testCases := []struct {
+		name      string
+		rawURL    string
+		wantID    string
+		wantMatch bool
+	}{
+		{name: "host format", rawURL: "yt-dlp://XZnZkASrArc", wantID: "XZnZkASrArc", wantMatch: true},
+		{name: "path format", rawURL: "yt-dlp:///XZnZkASrArc", wantID: "XZnZkASrArc", wantMatch: true},
+		{name: "http URL", rawURL: "https://example.com/video.mp4", wantID: "", wantMatch: false},
+		{name: "empty ID", rawURL: "yt-dlp://", wantID: "", wantMatch: false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, ok := extractYTDLPVideoID(tc.rawURL)
+			if ok != tc.wantMatch {
+				t.Fatalf("match = %v, want %v", ok, tc.wantMatch)
+			}
+			if id != tc.wantID {
+				t.Fatalf("id = %q, want %q", id, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestConfigureYTDLPCommand(t *testing.T) {
+	sched, _, _ := setupTestScheduler(t)
+
+	command := []string{"yt-dlp", "--cookies-from-browser", "firefox"}
+	sched.ConfigureYTDLPCommand(command)
+
+	got := sched.getYTDLPCommand()
+	if len(got) != len(command) {
+		t.Fatalf("command length = %d, want %d", len(got), len(command))
+	}
+	for i := range command {
+		if got[i] != command[i] {
+			t.Fatalf("command[%d] = %q, want %q", i, got[i], command[i])
+		}
 	}
 }

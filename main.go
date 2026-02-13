@@ -13,6 +13,7 @@ import (
 	"mitmcdn/src/config"
 	"mitmcdn/src/database"
 	"mitmcdn/src/download"
+	"mitmcdn/src/htmlplugin"
 	"mitmcdn/src/proxy"
 )
 
@@ -67,6 +68,12 @@ func main() {
 		log.Fatalf("Failed to initialize download scheduler: %v", err)
 	}
 
+	// Initialize HTML rewrite plugins
+	htmlPluginManager, err := htmlplugin.NewManager("plugins", "configs", cacheMgr, downloadSched)
+	if err != nil {
+		log.Fatalf("Failed to initialize HTML plugins: %v", err)
+	}
+
 	// Start servers based on proxy mode
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -75,7 +82,7 @@ func main() {
 	go startCleanup(ctx, cacheMgr, maxTotalSize)
 
 	// Start unified server that handles all protocols on a single port
-	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, db)
+	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, htmlPluginManager, db)
 	if err != nil {
 		log.Fatalf("Failed to create unified server: %v", err)
 	}

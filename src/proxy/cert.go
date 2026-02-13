@@ -20,6 +20,16 @@ const (
 	keyFile  = "mitmproxy-ca-key.pem"
 )
 
+// publicKey returns the public key for a private key
+func publicKey(priv any) any {
+	switch k := priv.(type) {
+	case *rsa.PrivateKey:
+		return &k.PublicKey
+	default:
+		return nil
+	}
+}
+
 // generateRootCA generates a root CA certificate for MITM
 func generateRootCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 	// Create private key
@@ -28,9 +38,16 @@ func generateRootCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 		return nil, nil, err
 	}
 
+	// Generate random serial number
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	// Create certificate template
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization:  []string{"MitmCDN Proxy"},
 			Country:       []string{"US"},
@@ -39,10 +56,10 @@ func generateRootCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 			StreetAddress: []string{""},
 			PostalCode:    []string{""},
 		},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(10, 0, 0), // Valid for 10 years
-		KeyUsage:     x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(10, 0, 0), // Valid for 10 years
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		MaxPathLen:            0,
@@ -50,7 +67,7 @@ func generateRootCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 	}
 
 	// Create certificate
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey(key), key)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -82,6 +99,14 @@ func loadOrCreateRootCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 			if certBlock != nil && keyBlock != nil {
 				cert, err := x509.ParseCertificate(certBlock.Bytes)
 				if err == nil {
+					// Try PKCS#8 format first (more standard, supports multiple key types)
+					privKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+					if err == nil {
+						if rsaKey, ok := privKey.(*rsa.PrivateKey); ok {
+							return cert, rsaKey, nil
+						}
+					}
+					// Fallback to PKCS#1 format for backward compatibility
 					key, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
 					if err == nil {
 						return cert, key, nil
@@ -111,10 +136,14 @@ func loadOrCreateRootCA() (*x509.Certificate, *rsa.PrivateKey, error) {
 		return nil, nil, err
 	}
 
-	// Save private key
+	// Save private key (using PKCS#8 format, more standard and supports multiple key types)
+	keyBytes, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(key),
+		Type:  "PRIVATE KEY",
+		Bytes: keyBytes,
 	})
 	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
 		return nil, nil, err
@@ -146,23 +175,30 @@ func generateCertificate(host string) (*tls.Certificate, error) {
 		return nil, err
 	}
 
+	// Generate random serial number
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, err
+	}
+
 	// Create certificate template
 	template := x509.Certificate{
-		SerialNumber: big.NewInt(time.Now().Unix()),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   host,
 			Organization: []string{"MitmCDN Proxy"},
 		},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(1, 0, 0), // Valid for 1 year
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(1, 0, 0), // Valid for 1 year
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		DNSNames:             []string{host},
+		DNSNames:              []string{host},
 	}
 
 	// Create certificate signed by CA
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, caCert, &key.PublicKey, caKey)
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, caCert, publicKey(key), caKey)
 	if err != nil {
 		return nil, err
 	}

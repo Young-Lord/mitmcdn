@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"mitmcdn/src/cache"
 	"mitmcdn/src/config"
 	"mitmcdn/src/download"
+	"mitmcdn/src/htmlplugin"
 
 	"gorm.io/gorm"
 )
@@ -24,12 +26,13 @@ type UnifiedServer struct {
 	reverseProxy  *HTTPReverseProxy
 	socks5Proxy   *SOCKS5Proxy
 	statusHandler *StatusHandler
+	listener      net.Listener
 }
 
 // NewUnifiedServer creates a unified server that can handle multiple protocols
-func NewUnifiedServer(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, db *gorm.DB) (*UnifiedServer, error) {
-	mitmProxy := NewMITMProxy(cfg, cacheMgr, sched)
-	reverseProxy := NewHTTPReverseProxy(cfg, cacheMgr, sched, mitmProxy)
+func NewUnifiedServer(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, htmlPlugins *htmlplugin.Manager, db *gorm.DB) (*UnifiedServer, error) {
+	mitmProxy := NewMITMProxy(cfg, cacheMgr, sched, htmlPlugins)
+	reverseProxy := NewHTTPReverseProxy(cfg, cacheMgr, sched, mitmProxy, htmlPlugins)
 
 	var socks5Proxy *SOCKS5Proxy
 	var err error
@@ -150,7 +153,10 @@ func (s *UnifiedServer) handleConnection(conn net.Conn) {
 	case "socks5":
 		if s.socks5Proxy != nil {
 			// Handle SOCKS5 - the connection has been peeked, so we need to handle it
-			s.socks5Proxy.server.ServeConn(peekConn)
+			// ServeConn is blocking, but we're already in a goroutine
+			if err := s.socks5Proxy.server.ServeConn(peekConn); err != nil {
+				// Log error but don't fail - connection might have been closed
+			}
 		} else {
 			conn.Close()
 		}
@@ -217,17 +223,22 @@ func (s *UnifiedServer) handleHTTPConnection(conn net.Conn) {
 	// Create a response writer
 	w := &responseWriter{
 		conn:   conn,
+		reader: br,
 		header: make(http.Header),
 		writer: bufio.NewWriter(conn),
 	}
 
 	// Handle the request
 	s.ServeHTTP(w, req)
-	
+
+	if w.hijacked {
+		return
+	}
+
 	// Close chunked encoding if used
 	w.Close()
 	w.Flush()
-	
+
 	// Ensure connection is closed after response
 	// For HTTP/1.1, if Content-Length is set correctly, connection should close automatically
 	// But we'll close it explicitly to be safe
@@ -239,10 +250,12 @@ func (s *UnifiedServer) handleHTTPConnection(conn net.Conn) {
 // responseWriter implements http.ResponseWriter for raw connections
 type responseWriter struct {
 	conn        net.Conn
+	reader      *bufio.Reader
 	header      http.Header
 	status      int
 	wroteHeader bool
 	chunked     bool
+	hijacked    bool
 	writer      *bufio.Writer
 }
 
@@ -254,7 +267,7 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	
+
 	if w.chunked {
 		// Write chunk size in hex
 		fmt.Fprintf(w.writer, "%x\r\n", len(b))
@@ -267,7 +280,7 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 		w.writer.Write([]byte("\r\n"))
 		return n, nil
 	}
-	
+
 	return w.writer.Write(b)
 }
 
@@ -277,14 +290,14 @@ func (w *responseWriter) WriteHeader(statusCode int) {
 	}
 	w.wroteHeader = true
 	w.status = statusCode
-	
+
 	// Determine if we need chunked encoding
 	// Use chunked if no Content-Length is set
 	if w.header.Get("Content-Length") == "" && w.header.Get("Transfer-Encoding") == "" {
 		w.chunked = true
 		w.header.Set("Transfer-Encoding", "chunked")
 	}
-	
+
 	statusText := http.StatusText(statusCode)
 	fmt.Fprintf(w.writer, "HTTP/1.1 %d %s\r\n", statusCode, statusText)
 	w.header.Write(w.writer)
@@ -298,8 +311,19 @@ func (w *responseWriter) Flush() {
 	}
 }
 
+func (w *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if w.hijacked {
+		return nil, nil, fmt.Errorf("connection already hijacked")
+	}
+	w.hijacked = true
+	return w.conn, bufio.NewReadWriter(w.reader, w.writer), nil
+}
+
 // Close closes the response writer and sends the final chunk if using chunked encoding
 func (w *responseWriter) Close() error {
+	if w.hijacked {
+		return nil
+	}
 	if w.chunked && w.wroteHeader {
 		// Send final chunk (0-sized chunk to signal end)
 		w.writer.Write([]byte("0\r\n\r\n"))
@@ -316,6 +340,7 @@ func (s *UnifiedServer) ListenAndServe(addr string) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
+	s.listener = listener
 
 	// Start accepting connections with protocol detection
 	for {
@@ -326,4 +351,12 @@ func (s *UnifiedServer) ListenAndServe(addr string) error {
 
 		go s.handleConnection(conn)
 	}
+}
+
+// Shutdown gracefully shuts down the server
+func (s *UnifiedServer) Shutdown(ctx context.Context) error {
+	if s.listener != nil {
+		return s.listener.Close()
+	}
+	return nil
 }

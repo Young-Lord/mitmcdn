@@ -6,7 +6,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/armon/go-socks5"
+	"github.com/things-go/go-socks5"
 	"mitmcdn/src/cache"
 	"mitmcdn/src/config"
 	"mitmcdn/src/download"
@@ -34,15 +34,10 @@ func NewSOCKS5Proxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download
 		mitmProxy:     mitm,
 	}
 
-	conf := &socks5.Config{
-		Resolver: resolver,
-		Dial:     dialer.Dial,
-	}
-
-	server, err := socks5.New(conf)
-	if err != nil {
-		return nil, err
-	}
+	server := socks5.NewServer(
+		socks5.WithResolver(resolver),
+		socks5.WithDial(dialer.Dial),
+	)
 
 	return &SOCKS5Proxy{
 		config:        cfg,
@@ -54,17 +49,16 @@ func NewSOCKS5Proxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download
 }
 
 func (p *SOCKS5Proxy) ListenAndServe(addr string) error {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
+	return p.server.ListenAndServe("tcp", addr)
+}
 
+// Serve serves connections from the given listener
+func (p *SOCKS5Proxy) Serve(listener net.Listener) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			continue
+			return err
 		}
-
 		go func() {
 			defer conn.Close()
 			p.server.ServeConn(conn)

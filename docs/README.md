@@ -107,7 +107,7 @@ ttl = "72h"                # 缓存过期时间
 
 直接访问：
 ```
-http://mitmcdn.example.com:8081/https://origin.cdn.com/video.mp4
+http://mitmcdn.httpbin.org:8081/https://httpbin.org/get?a=1
 ```
 
 ## 架构说明

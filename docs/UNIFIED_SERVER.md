@@ -21,12 +21,12 @@ MitmCDN 现在支持**统一服务器模式**，所有4个服务可以在**同�
 ### 3. HTTP Reverse Proxy (URL Path 模式)
 - **协议检测**: HTTP 请求，路径以 `/http://` 或 `/https://` 开头
 - **使用方式**: 直接访问 `http://listen_address/https://target.com/file`
-- **示例**: `http://127.0.0.1:8081/https://example.com/video.mp4`
+- **示例**: `http://127.0.0.1:8081/https://httpbin.org/get?a=1`
 
 ### 4. HTTPS Server
 - **协议检测**: TLS 握手（第一个字节为 0x16）
 - **使用方式**: 通过 HTTPS 访问 `https://listen_address`
-- **示例**: `https://127.0.0.1:8081/https://example.com/file`
+- **示例**: `https://127.0.0.1:8081/https://httpbin.org/get?a=1`
 
 ## 协议检测机制
 
@@ -60,7 +60,7 @@ export http_proxy=http://127.0.0.1:8081
 export https_proxy=http://127.0.0.1:8081
 
 # 或使用 curl
-curl -x http://127.0.0.1:8081 https://example.com/
+curl -x http://127.0.0.1:8081 https://httpbin.org/get?a=1
 ```
 
 ### SOCKS5 Proxy
@@ -69,19 +69,19 @@ curl -x http://127.0.0.1:8081 https://example.com/
 export ALL_PROXY=socks5://127.0.0.1:8081
 
 # 或使用 curl
-curl --socks5 127.0.0.1:8081 https://example.com/
+curl --socks5 127.0.0.1:8081 https://httpbin.org/get?a=1
 ```
 
 ### HTTP Reverse Proxy
 ```bash
 # 直接访问
-curl http://127.0.0.1:8081/https://example.com/video.mp4
+curl http://127.0.0.1:8081/https://httpbin.org/get?a=1
 ```
 
 ### HTTPS Server
 ```bash
 # 通过 HTTPS 访问（需要信任自签名证书）
-curl -k https://127.0.0.1:8081/https://example.com/file
+curl -k https://127.0.0.1:8081/https://httpbin.org/get?a=1
 ```
 
 ## 优势

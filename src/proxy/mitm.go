@@ -17,20 +17,23 @@ import (
 	"mitmcdn/src/cache"
 	"mitmcdn/src/config"
 	"mitmcdn/src/download"
+	"mitmcdn/src/htmlplugin"
 )
 
 type MITMProxy struct {
 	config        *config.Config
 	cacheManager  *cache.Manager
 	downloadSched *download.Scheduler
+	htmlPlugins   *htmlplugin.Manager
 	certCache     sync.Map // host -> *tls.Certificate
 }
 
-func NewMITMProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler) *MITMProxy {
+func NewMITMProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, htmlPlugins *htmlplugin.Manager) *MITMProxy {
 	return &MITMProxy{
 		config:        cfg,
 		cacheManager:  cacheMgr,
 		downloadSched: sched,
+		htmlPlugins:   htmlPlugins,
 	}
 }
 
@@ -108,8 +111,131 @@ func (p *MITMProxy) handleTLSConnection(conn *tls.Conn, host string) {
 		req.URL.Path = "/"
 	}
 
-	// Process request
-	p.processRequest(req, conn)
+	// Create a response writer for TLS connection
+	w := &tlsResponseWriter{
+		conn:   conn,
+		header: make(http.Header),
+		writer: bufio.NewWriter(conn),
+	}
+
+	// Process request with response writer
+	p.processRequestWithWriter(req, w)
+	w.Close()
+	w.Flush()
+}
+
+// tlsResponseWriter implements http.ResponseWriter for TLS connections
+type tlsResponseWriter struct {
+	conn        net.Conn
+	header      http.Header
+	status      int
+	wroteHeader bool
+	chunked     bool
+	writer      *bufio.Writer
+}
+
+func (w *tlsResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *tlsResponseWriter) Write(b []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+
+	if w.chunked {
+		// Write chunk size in hex
+		fmt.Fprintf(w.writer, "%x\r\n", len(b))
+		// Write chunk data
+		n, err := w.writer.Write(b)
+		if err != nil {
+			return n, err
+		}
+		// Write chunk trailer
+		w.writer.Write([]byte("\r\n"))
+		return n, nil
+	}
+
+	return w.writer.Write(b)
+}
+
+func (w *tlsResponseWriter) WriteHeader(statusCode int) {
+	if w.wroteHeader {
+		return // Already written
+	}
+	w.wroteHeader = true
+	w.status = statusCode
+
+	// Determine if we need chunked encoding
+	// Use chunked if no Content-Length is set
+	if w.header.Get("Content-Length") == "" && w.header.Get("Transfer-Encoding") == "" {
+		w.chunked = true
+		w.header.Set("Transfer-Encoding", "chunked")
+	}
+
+	statusText := http.StatusText(statusCode)
+	fmt.Fprintf(w.writer, "HTTP/1.1 %d %s\r\n", statusCode, statusText)
+	w.header.Write(w.writer)
+	w.writer.Write([]byte("\r\n"))
+	w.writer.Flush()
+}
+
+func (w *tlsResponseWriter) Flush() {
+	if w.writer != nil {
+		w.writer.Flush()
+	}
+}
+
+func (w *tlsResponseWriter) Close() error {
+	if w.chunked && w.wroteHeader {
+		w.writer.Write([]byte("0\r\n\r\n"))
+		w.writer.Flush()
+	}
+	return nil
+}
+
+// processRequestWithWriter processes a request with a proper ResponseWriter
+func (p *MITMProxy) processRequestWithWriter(r *http.Request, w http.ResponseWriter) {
+	// Check CDN rules
+	rule := p.findMatchingRule(r.URL.String(), r.Host)
+	if rule == nil {
+		// Not a CDN file, forward normally
+		p.forwardHTTP(w, r)
+		return
+	}
+
+	// Extract cookie
+	cookie := r.Header.Get("Cookie")
+
+	// Extract filename
+	filename := p.extractFilename(r.URL.Path)
+
+	// Get or create file entry
+	file, err := p.cacheManager.GetOrCreateFile(
+		r.URL.String(),
+		cookie,
+		filename,
+		rule.DedupStrategy,
+	)
+	if err != nil {
+		// Log error with stack trace and forward
+		logErrorWithStack(err, "Failed to get or create file: %s", r.URL.String())
+		p.forwardHTTP(w, r)
+		return
+	}
+
+	// Check if file is complete
+	if file.DownloadStatus == "complete" {
+		// Serve from cache
+		http.ServeFile(w, r, file.SavedPath)
+		return
+	}
+
+	// Stream file (will trigger download if needed)
+	if err := p.downloadSched.StreamFile(file, w, r); err != nil {
+		logErrorWithStack(err, "Failed to stream file: %s", r.URL.String())
+		// Error already sent to client by StreamFile
+	}
 }
 
 // handleHTTPRequest handles plain HTTP requests
@@ -132,7 +258,7 @@ func (p *MITMProxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process intercepted request
-	p.processRequest(r, w)
+	p.processRequestWithWriter(r, w)
 }
 
 // processRequest processes intercepted requests
@@ -292,7 +418,7 @@ func (p *MITMProxy) serveFromAssets(w http.ResponseWriter, r *http.Request) bool
 
 	// Build file path
 	filePath := filepath.Join(p.config.AssetsDir, filename)
-	
+
 	// Security: ensure file is within assets directory
 	absAssetsDir, err := filepath.Abs(p.config.AssetsDir)
 	if err != nil {
@@ -324,6 +450,13 @@ func (p *MITMProxy) forwardHTTP(w http.ResponseWriter, r *http.Request) {
 			if req.URL.Scheme == "" {
 				req.URL.Scheme = "https"
 			}
+			req.Header.Del("Accept-Encoding")
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			if p.htmlPlugins == nil {
+				return nil
+			}
+			return p.htmlPlugins.ModifyResponse(resp)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logErrorWithStack(err, "HTTP proxy error: %s %s", r.Method, r.URL.String())

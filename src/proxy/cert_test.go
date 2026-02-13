@@ -94,7 +94,7 @@ func TestGenerateCertificate(t *testing.T) {
 		}
 	}()
 
-	host := "example.com"
+	host := "httpbin.org"
 	cert, err := generateCertificate(host)
 	if err != nil {
 		t.Fatalf("generateCertificate() error = %v", err)
@@ -140,7 +140,7 @@ func TestGenerateCertificateMultipleHosts(t *testing.T) {
 		}
 	}()
 
-	hosts := []string{"example.com", "test.com", "cdn.example.com"}
+	hosts := []string{"httpbin.org", "test.com", "cdn.httpbin.org"}
 
 	for _, host := range hosts {
 		cert, err := generateCertificate(host)

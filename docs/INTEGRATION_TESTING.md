@@ -108,7 +108,7 @@ go test -v -run "TestHTTPProxy|TestHTTPSProxy|TestSOCKS5Proxy|TestHTTPReversePro
 测试使用以下客户端配置：
 - **HTTP 客户端**: 配置代理，信任所有证书（`InsecureSkipVerify: true`）
 - **超时设置**: 10-15 秒
-- **测试 URL**: `https://example.com/` 或 `http://example.com/`
+- **测试 URL**: `https://httpbin.org/get?a=1` 或 `http://httpbin.org/get?a=1`
 
 ### 证书处理
 
@@ -150,7 +150,7 @@ HTTP 客户端（从上游下载）
 
 ## 注意事项
 
-1. **网络依赖**: 测试需要访问 `example.com`，需要网络连接
+1. **网络依赖**: 测试需要访问 `httpbin.org`，需要网络连接
 2. **证书信任**: 测试环境使用 `InsecureSkipVerify`，生产环境不应使用
 3. **超时设置**: 某些测试可能需要较长时间，设置了 60 秒超时
 4. **临时文件**: 所有测试使用临时目录，测试后自动清理
