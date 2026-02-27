@@ -1,11 +1,13 @@
 # MitmCDN Cache Server Configuration
 
 # Service listening configuration
-listen_address = "0.0.0.0:8081"
+# All services (HTTP Proxy, SOCKS5 Proxy, HTTP Reverse Proxy, HTTPS Server) 
+# will listen on the same address and port, with automatic protocol detection
+listen_address = "127.0.0.1:8081"
 proxy_mode = "all"  # Options: http, socks5, url_path, or all
 
 # Upstream proxy (supports chained proxy to bypass network restrictions)
-# Format: http://proxy.httpbin.org:8080 or socks5://127.0.0.1:1080
+# Format: http://proxy.example.com:8080 or socks5://127.0.0.1:1080
 upstream_proxy = ""
 
 # Assets directory for fallback (e.g., favicon.ico, static files)
@@ -14,22 +16,22 @@ assets_dir = "./assets"
 
 # Cache configuration
 [cache]
-cache_dir = "/var/lib/mitmcdn/data"
+cache_dir = "./data"
 max_file_size = "5G"       # Maximum size for a single file
 max_total_size = "100G"   # Total cache pool size limit (triggers LRU eviction)
 ttl = "72h"               # Cache file expiration time
 
 # CDN interception rules
 [[cdn_rules]]
-domain = "origin.cdn.com"
+domain = "httpbin.org"
 # URL regex pattern to match files
-match_pattern = "\\.(mp4|exe|zip|rar|7z|tar|gz)$"
+match_pattern = ""
 # Deduplication strategy: full_url (entire URL) or filename_only (filename only)
-dedup_strategy = "filename_only"
+dedup_strategy = "full_url"
 
 # Example: Another CDN rule
 # [[cdn_rules]]
-# domain = "another-cdn.httpbin.org"
+# domain = "another-cdn.example.com"
 # match_pattern = "\\.(mp4|mkv|avi)$"
 # dedup_strategy = "full_url"
 
@@ -42,3 +44,4 @@ dedup_strategy = "filename_only"
 #
 # yt-dlp command is configured in that plugin config:
 #   yt_dlp_command = ["yt-dlp", "--cookies-from-browser", "firefox"]
+
