@@ -408,7 +408,28 @@ func (s *Scheduler) downloadYTDLPTask(task *Task, videoID string) {
 		return
 	}
 
-	if err := os.Rename(tempPath, task.file.SavedPath); err != nil {
+	// yt-dlp may append a different extension after merging formats
+	// (e.g. ".part.webm" instead of ".part"), so glob for the actual output file.
+	actualPath := tempPath
+	if _, statErr := os.Stat(tempPath); os.IsNotExist(statErr) {
+		matches, _ := filepath.Glob(tempPath + ".*")
+		if len(matches) == 1 {
+			actualPath = matches[0]
+		} else if len(matches) > 1 {
+			// Pick the largest file (the merged output)
+			var best string
+			var bestSize int64
+			for _, m := range matches {
+				if fi, e := os.Stat(m); e == nil && fi.Size() > bestSize {
+					best = m
+					bestSize = fi.Size()
+				}
+			}
+			actualPath = best
+		}
+	}
+
+	if err := os.Rename(actualPath, task.file.SavedPath); err != nil {
 		s.handleDownloadError(task, fmt.Errorf("failed to finalize yt-dlp output: %w", err))
 		return
 	}
@@ -419,18 +440,31 @@ func (s *Scheduler) downloadYTDLPTask(task *Task, videoID string) {
 		return
 	}
 
+	// Determine content type from the actual file extension yt-dlp produced.
+	contentType := "video/mp4"
+	if actualPath != tempPath {
+		switch strings.ToLower(filepath.Ext(actualPath)) {
+		case ".webm":
+			contentType = "video/webm"
+		case ".mkv":
+			contentType = "video/x-matroska"
+		case ".mp4":
+			contentType = "video/mp4"
+		}
+	}
+
 	now := time.Now()
 	s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(map[string]interface{}{
 		"download_status":  "complete",
 		"downloaded_bytes": info.Size(),
 		"file_size":        info.Size(),
-		"content_type":     "video/mp4",
+		"content_type":     contentType,
 		"completed_at":     &now,
 	})
 
 	task.mu.Lock()
 	task.Status = "complete"
-	task.file.ContentType = "video/mp4"
+	task.file.ContentType = contentType
 	task.file.FileSize = info.Size()
 	task.mu.Unlock()
 

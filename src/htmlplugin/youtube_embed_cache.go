@@ -63,7 +63,7 @@ func NewYouTubeEmbedCachePlugin(configPath string, cacheMgr *cache.Manager, sche
 
 	return &YouTubeEmbedCachePlugin{
 		urlPatterns:        compiledPatterns,
-		youtubeIframeRegex: regexp.MustCompile(`(?is)<iframe[^>]*\bsrc=(['"])(?:(?:https?:)?//)?(?:www\.)?youtube\.com/embed/([A-Za-z0-9_-]{6,})[^'"]*\1[^>]*>\s*</iframe>`),
+		youtubeIframeRegex: regexp.MustCompile(`(?is)<iframe[^>]*\bsrc=["'](?:(?:https?:)?//)?(?:www\.)?youtube\.com/embed/([A-Za-z0-9_-]{6,})[^"']*["'][^>]*>\s*</iframe>`),
 		cacheManager:       cacheMgr,
 		downloadSched:      sched,
 		downloadPriority:   priority,
@@ -82,12 +82,17 @@ func (p *YouTubeEmbedCachePlugin) Process(pageURL, html string) (string, bool, e
 	videoIDs := make(map[string]struct{})
 	modified := p.youtubeIframeRegex.ReplaceAllStringFunc(html, func(match string) string {
 		parts := p.youtubeIframeRegex.FindStringSubmatch(match)
-		if len(parts) < 3 {
+		if len(parts) < 2 {
 			return match
 		}
 
-		videoID := parts[2]
+		videoID := parts[1]
 		videoIDs[videoID] = struct{}{}
+
+		// Check if the video is already cached and complete.
+		if p.isVideoCached(videoID) {
+			return fmt.Sprintf(`<iframe frameborder="0" allowfullscreen style="border: none;position: absolute;top: 0;left: 0;width: 100%%;height: 100%%;" src="/cache/yt/%s/player"></iframe>`, videoID)
+		}
 
 		return fmt.Sprintf(`<iframe frameborder="0" allowfullscreen style="border: none;position: absolute;top: 0;left: 0;width: 100%%;height: 100%%;" src="//www.youtube.com/embed/%s"></iframe>`, videoID)
 	})
@@ -112,6 +117,16 @@ func (p *YouTubeEmbedCachePlugin) matchesURL(pageURL string) bool {
 		}
 	}
 	return false
+}
+
+// isVideoCached returns true if the video has been fully downloaded.
+func (p *YouTubeEmbedCachePlugin) isVideoCached(videoID string) bool {
+	cacheURL := fmt.Sprintf("yt-dlp://%s", videoID)
+	file, err := p.cacheManager.GetOrCreateFile(cacheURL, "", videoID+".mp4", "full_url")
+	if err != nil {
+		return false
+	}
+	return file.DownloadStatus == "complete"
 }
 
 func (p *YouTubeEmbedCachePlugin) ensureVideoCached(videoID string) error {

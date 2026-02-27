@@ -3,14 +3,21 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"mitmcdn/src/cache"
 	"mitmcdn/src/config"
+	"mitmcdn/src/database"
 	"mitmcdn/src/download"
 	"mitmcdn/src/htmlplugin"
 
@@ -20,6 +27,7 @@ import (
 // UnifiedServer handles multiple protocols on a single port
 type UnifiedServer struct {
 	config        *config.Config
+	db            *gorm.DB
 	cacheManager  *cache.Manager
 	downloadSched *download.Scheduler
 	mitmProxy     *MITMProxy
@@ -51,6 +59,7 @@ func NewUnifiedServer(cfg *config.Config, cacheMgr *cache.Manager, sched *downlo
 
 	return &UnifiedServer{
 		config:        cfg,
+		db:            db,
 		cacheManager:  cacheMgr,
 		downloadSched: sched,
 		mitmProxy:     mitmProxy,
@@ -80,6 +89,12 @@ func (s *UnifiedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		http.Error(w, "Status handler not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Handle cached YouTube video endpoints
+	if strings.HasPrefix(path, "/cache/yt/") {
+		s.handleCacheYT(w, r, path)
 		return
 	}
 
@@ -208,42 +223,38 @@ func (p *peekConn) Read(b []byte) (int, error) {
 	return p.Conn.Read(b)
 }
 
-// handleHTTPConnection handles HTTP connection
+// handleHTTPConnection handles HTTP connection with keep-alive support
 func (s *UnifiedServer) handleHTTPConnection(conn net.Conn) {
-	// Create a buffered reader to read the request
 	br := bufio.NewReader(conn)
 
-	// Read HTTP request
-	req, err := http.ReadRequest(br)
-	if err != nil {
-		conn.Close()
-		return
-	}
+	for {
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			conn.Close()
+			return
+		}
 
-	// Create a response writer
-	w := &responseWriter{
-		conn:   conn,
-		reader: br,
-		header: make(http.Header),
-		writer: bufio.NewWriter(conn),
-	}
+		w := &responseWriter{
+			conn:   conn,
+			reader: br,
+			header: make(http.Header),
+			writer: bufio.NewWriter(conn),
+		}
 
-	// Handle the request
-	s.ServeHTTP(w, req)
+		s.ServeHTTP(w, req)
 
-	if w.hijacked {
-		return
-	}
+		if w.hijacked {
+			return
+		}
 
-	// Close chunked encoding if used
-	w.Close()
-	w.Flush()
+		w.Close()
+		w.Flush()
 
-	// Ensure connection is closed after response
-	// For HTTP/1.1, if Content-Length is set correctly, connection should close automatically
-	// But we'll close it explicitly to be safe
-	if req.Close || req.Header.Get("Connection") == "close" {
-		conn.Close()
+		// Close connection if client requested it or HTTP/1.0
+		if req.Close || req.Header.Get("Connection") == "close" || req.ProtoMajor < 1 || (req.ProtoMajor == 1 && req.ProtoMinor == 0) {
+			conn.Close()
+			return
+		}
 	}
 }
 
@@ -359,4 +370,130 @@ func (s *UnifiedServer) Shutdown(ctx context.Context) error {
 		return s.listener.Close()
 	}
 	return nil
+}
+
+var ytVideoIDRegex = regexp.MustCompile(`^/cache/yt/([A-Za-z0-9_-]{6,})/(player|video)$`)
+
+// handleCacheYT serves cached YouTube video files and an embedded player page.
+func (s *UnifiedServer) handleCacheYT(w http.ResponseWriter, r *http.Request, path string) {
+	m := ytVideoIDRegex.FindStringSubmatch(path)
+	if m == nil {
+		http.NotFound(w, r)
+		return
+	}
+	videoID := m[1]
+	action := m[2]
+
+	// Look up the cache entry for this video.
+	cacheURL := fmt.Sprintf("yt-dlp://%s", videoID)
+	hashBytes := sha256.Sum256([]byte(cacheURL))
+	fileHash := hex.EncodeToString(hashBytes[:])
+
+	var file database.File
+	if err := s.db.Where("file_hash = ?", fileHash).First(&file).Error; err != nil {
+		http.Error(w, "Video not cached", http.StatusNotFound)
+		return
+	}
+
+	switch action {
+	case "video":
+		s.serveCachedVideo(w, r, &file)
+	case "player":
+		s.serveVideoPlayer(w, r, videoID, &file)
+	}
+}
+
+// serveCachedVideo streams the cached video file with Range support.
+func (s *UnifiedServer) serveCachedVideo(w http.ResponseWriter, r *http.Request, file *database.File) {
+	if file.DownloadStatus != "complete" {
+		http.Error(w, "Video still downloading", http.StatusServiceUnavailable)
+		return
+	}
+
+	f, err := os.Open(file.SavedPath)
+	if err != nil {
+		http.Error(w, "Cache file not found", http.StatusNotFound)
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, "Internal error", http.StatusInternalServerError)
+		return
+	}
+
+	ct := file.ContentType
+	if ct == "" {
+		ct = "video/mp4"
+	}
+
+	totalSize := info.Size()
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	rangeHeader := r.Header.Get("Range")
+	if rangeHeader == "" {
+		// Full response
+		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+		w.WriteHeader(http.StatusOK)
+		io.CopyN(w, f, totalSize)
+		return
+	}
+
+	// Parse "bytes=START-END"
+	var start, end int64
+	end = totalSize - 1
+	n, _ := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
+	if n == 0 {
+		// Try "bytes=START-"
+		fmt.Sscanf(rangeHeader, "bytes=%d-", &start)
+		end = totalSize - 1
+	}
+	if start < 0 || start >= totalSize || end >= totalSize || start > end {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
+		http.Error(w, "Range Not Satisfiable", http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+
+	length := end - start + 1
+	f.Seek(start, io.SeekStart)
+
+	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
+	w.WriteHeader(http.StatusPartialContent)
+	io.CopyN(w, f, length)
+}
+
+// serveVideoPlayer returns a minimal HTML5 video player page.
+func (s *UnifiedServer) serveVideoPlayer(w http.ResponseWriter, r *http.Request, videoID string, file *database.File) {
+	videoSrc := fmt.Sprintf("/cache/yt/%s/video", videoID)
+
+	var statusNote string
+	switch file.DownloadStatus {
+	case "complete":
+		statusNote = ""
+	case "downloading":
+		statusNote = `<p style="color:#f0ad4e;text-align:center;">Video is still downloading&hellip; Refresh later.</p>`
+	default:
+		statusNote = fmt.Sprintf(`<p style="color:#d9534f;text-align:center;">Video status: %s</p>`, file.DownloadStatus)
+	}
+
+	ct := file.ContentType
+	if ct == "" {
+		ct = "video/mp4"
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%s - Cached Video</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}html,body{width:100%%;height:100%%;background:#000;overflow:hidden}
+video{width:100%%;height:100%%;object-fit:contain}</style></head>
+<body>%s<video controls autoplay><source src="%s" type="%s">Your browser does not support the video tag.</video></body></html>`,
+		videoID, statusNote, videoSrc, ct)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(html)))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(html))
 }

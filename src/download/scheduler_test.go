@@ -2,8 +2,11 @@ package download
 
 import (
 	"crypto/tls"
+	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +15,36 @@ import (
 
 	"gorm.io/gorm"
 )
+
+func createFakeYTDLPScript(t *testing.T, scriptBody string) string {
+	t.Helper()
+
+	scriptPath := filepath.Join(t.TempDir(), "fake-yt-dlp.sh")
+	content := "#!/bin/sh\nset -eu\n" + scriptBody + "\n"
+	if err := os.WriteFile(scriptPath, []byte(content), 0755); err != nil {
+		t.Fatalf("failed to write fake yt-dlp script: %v", err)
+	}
+	return scriptPath
+}
+
+func waitForFileStatus(t *testing.T, db *gorm.DB, fileHash string, status string, timeout time.Duration) database.File {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var file database.File
+		err := db.Where("file_hash = ?", fileHash).First(&file).Error
+		if err == nil && file.DownloadStatus == status {
+			return file
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	var last database.File
+	_ = db.Where("file_hash = ?", fileHash).First(&last).Error
+	t.Fatalf("timeout waiting for file %s to reach status %s, last status=%s", fileHash, status, last.DownloadStatus)
+	return database.File{}
+}
 
 func setupTestScheduler(t *testing.T) (*Scheduler, *gorm.DB, *cache.Manager) {
 	// Setup database using database.InitDB
@@ -270,5 +303,78 @@ func TestConfigureYTDLPCommand(t *testing.T) {
 		if got[i] != command[i] {
 			t.Fatalf("command[%d] = %q, want %q", i, got[i], command[i])
 		}
+	}
+}
+
+func TestStartDownloadYTDLPSuccess(t *testing.T) {
+	sched, db, cacheMgr := setupTestScheduler(t)
+
+	scriptPath := createFakeYTDLPScript(t, `out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+printf 'fake-video-content' > "$out"`)
+
+	sched.ConfigureYTDLPCommand([]string{scriptPath})
+
+	videoID := "XZnZkASrArc"
+	url := fmt.Sprintf("yt-dlp://%s", videoID)
+	file, err := cacheMgr.GetOrCreateFile(url, "", videoID+".mp4", "full_url")
+	if err != nil {
+		t.Fatalf("failed to create file: %v", err)
+	}
+
+	if err := sched.StartDownload(file, file.OriginalURL, "", 100); err != nil {
+		t.Fatalf("StartDownload failed: %v", err)
+	}
+
+	updated := waitForFileStatus(t, db, file.FileHash, "complete", 3*time.Second)
+	if updated.ContentType != "video/mp4" {
+		t.Fatalf("content type = %q, want video/mp4", updated.ContentType)
+	}
+	if updated.FileSize <= 0 {
+		t.Fatalf("file size = %d, want > 0", updated.FileSize)
+	}
+
+	data, err := os.ReadFile(updated.SavedPath)
+	if err != nil {
+		t.Fatalf("failed to read saved file: %v", err)
+	}
+	if string(data) != "fake-video-content" {
+		t.Fatalf("saved content mismatch: %q", string(data))
+	}
+}
+
+func TestStartDownloadYTDLPFailure(t *testing.T) {
+	sched, db, cacheMgr := setupTestScheduler(t)
+
+	scriptPath := createFakeYTDLPScript(t, `echo 'boom' >&2
+exit 7`)
+	sched.ConfigureYTDLPCommand([]string{scriptPath})
+
+	videoID := "FailVideo01"
+	url := fmt.Sprintf("yt-dlp://%s", videoID)
+	file, err := cacheMgr.GetOrCreateFile(url, "", videoID+".mp4", "full_url")
+	if err != nil {
+		t.Fatalf("failed to create file: %v", err)
+	}
+
+	if err := sched.StartDownload(file, file.OriginalURL, "", 100); err != nil {
+		t.Fatalf("StartDownload failed: %v", err)
+	}
+
+	_ = waitForFileStatus(t, db, file.FileHash, "failed", 3*time.Second)
+
+	var logEntry database.Log
+	if err := db.Where("file_hash = ?", file.FileHash).Order("created_at DESC").First(&logEntry).Error; err != nil {
+		t.Fatalf("failed to load log entry: %v", err)
+	}
+	if !strings.Contains(logEntry.Message, "yt-dlp failed") {
+		t.Fatalf("unexpected log message: %q", logEntry.Message)
 	}
 }
