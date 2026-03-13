@@ -21,6 +21,7 @@ import (
 	"mitmcdn/src/database"
 	"mitmcdn/src/download"
 	"mitmcdn/src/proxy"
+	"mitmcdn/src/rules"
 
 	socksproxy "golang.org/x/net/proxy"
 	"gorm.io/gorm"
@@ -32,6 +33,7 @@ type testServer struct {
 	db              *gorm.DB
 	cacheMgr        *cache.Manager
 	downloadSched   *download.Scheduler
+	rulesEngine     *rules.Engine
 	mitmProxy       *proxy.MITMProxy
 	httpServer      *http.Server
 	reverseServer   *http.Server
@@ -66,16 +68,22 @@ func setupTestServer(t *testing.T) *testServer {
 			MaxTotalSize: "1G",
 			TTL:          "1h",
 		},
-		CDNRules: []config.CDNRule{
-			{
-				Domain:        "httpbin.org",
-				MatchPattern:  ".*",
-				DedupStrategy: "filename_only",
-			},
-			// Note: baidu.com is intentionally NOT in CDNRules
-			// This means requests to baidu.com will be proxied but NOT cached
-			// This allows us to test both cached and non-cached scenarios
+	}
+
+	ruleList := []config.CacheRule{
+		{
+			Name:          "httpbin-cache",
+			Scope:         "request_only",
+			Expr:          "host contains \"httpbin.org\"",
+			Action:        "cache",
+			DedupStrategy: "filename_only",
+			Priority:      100,
 		},
+	}
+
+	rulesEngine, err := rules.NewEngine(ruleList)
+	if err != nil {
+		t.Fatalf("Failed to compile cache rules: %v", err)
 	}
 
 	// Initialize database
@@ -104,7 +112,7 @@ func setupTestServer(t *testing.T) *testServer {
 	}
 
 	// Initialize MITM proxy
-	mitmProxy := proxy.NewMITMProxy(cfg, cacheMgr, downloadSched, nil)
+	mitmProxy := proxy.NewMITMProxy(cfg, cacheMgr, downloadSched, nil, rulesEngine)
 
 	// Create HTTP listener for proxy
 	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -130,7 +138,7 @@ func setupTestServer(t *testing.T) *testServer {
 	socks5Addr := socks5Listener.Addr().String()
 
 	// Create reverse proxy
-	reverseProxy := proxy.NewHTTPReverseProxy(cfg, cacheMgr, downloadSched, mitmProxy, nil)
+	reverseProxy := proxy.NewHTTPReverseProxy(cfg, cacheMgr, downloadSched, mitmProxy, nil, rulesEngine)
 	reverseListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to listen reverse: %v", err)
@@ -199,6 +207,7 @@ func setupTestServer(t *testing.T) *testServer {
 		db:              db,
 		cacheMgr:        cacheMgr,
 		downloadSched:   downloadSched,
+		rulesEngine:     rulesEngine,
 		mitmProxy:       mitmProxy,
 		httpServer:      httpServer,
 		reverseServer:   reverseServer,
@@ -901,26 +910,45 @@ func TestFullFlow(t *testing.T) {
 	t.Log("Full flow test completed")
 }
 
-// TestCDNRuleMatching tests CDN rule matching
-func TestCDNRuleMatching(t *testing.T) {
+// TestCacheRuleMatching tests expr-based rule matching
+func TestCacheRuleMatching(t *testing.T) {
 	server := setupTestServer(t)
 	defer server.cleanup()
 
-	// Test that httpbin.org matches our CDN rule
-	testURL := "https://httpbin.org/get?a=1"
-	rule := server.config.CDNRules[0]
-
-	if !cache.MatchCDNRule(testURL, rule.Domain, rule.MatchPattern) {
-		t.Error("httpbin.org should match CDN rule")
+	req := rules.RequestData{
+		Method: "GET",
+		URL:    "https://httpbin.org/get?a=1",
+		Host:   "httpbin.org",
+		Path:   "/get",
+		Scheme: "https",
+		Query:  "a=1",
 	}
 
-	// Test that other domain doesn't match
-	testURL2 := "https://other.com/test.html"
-	if cache.MatchCDNRule(testURL2, rule.Domain, rule.MatchPattern) {
-		t.Error("other.com should not match CDN rule")
+	decision, matched, err := server.rulesEngine.Evaluate(req, nil)
+	if err != nil {
+		t.Fatalf("rule evaluation failed: %v", err)
+	}
+	if !matched || decision.Action != rules.ActionCache {
+		t.Fatalf("expected cache rule match for httpbin.org")
 	}
 
-	t.Log("CDN rule matching test successful")
+	req2 := rules.RequestData{
+		Method: "GET",
+		URL:    "https://other.com/test.html",
+		Host:   "other.com",
+		Path:   "/test.html",
+		Scheme: "https",
+	}
+
+	_, matched, err = server.rulesEngine.Evaluate(req2, nil)
+	if err != nil {
+		t.Fatalf("rule evaluation failed: %v", err)
+	}
+	if matched {
+		t.Fatalf("expected no rule match for other.com")
+	}
+
+	t.Log("Cache rule matching test successful")
 }
 
 // TestStatusEndpoints tests status API and HTML page
@@ -961,8 +989,13 @@ func TestStatusEndpoints(t *testing.T) {
 		ProxyMode:     "all",
 	}
 
+	statusRules, err := rules.NewEngine(nil)
+	if err != nil {
+		t.Fatalf("Failed to compile cache rules: %v", err)
+	}
+
 	// Create unified server
-	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, nil, db)
+	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, nil, db, statusRules)
 	if err != nil {
 		t.Fatalf("Failed to create unified server: %v", err)
 	}
@@ -1121,16 +1154,24 @@ func TestUnifiedServerHTTPSProxyConnect(t *testing.T) {
 	cfg := &config.Config{
 		ListenAddress: "127.0.0.1:0",
 		ProxyMode:     "all",
-		CDNRules: []config.CDNRule{
-			{
-				Domain:        upstreamURL.Hostname(),
-				MatchPattern:  ".*",
-				DedupStrategy: "full_url",
-			},
-		},
 	}
 
-	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, nil, db)
+	ruleList := []config.CacheRule{
+		{
+			Name:          "upstream-cache",
+			Scope:         "request_only",
+			Expr:          "host contains \"" + upstreamURL.Hostname() + "\"",
+			Action:        "cache",
+			DedupStrategy: "full_url",
+			Priority:      100,
+		},
+	}
+	rulesEngine, err := rules.NewEngine(ruleList)
+	if err != nil {
+		t.Fatalf("Failed to compile cache rules: %v", err)
+	}
+
+	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, nil, db, rulesEngine)
 	if err != nil {
 		t.Fatalf("Failed to create unified server: %v", err)
 	}
@@ -1220,16 +1261,24 @@ func TestUnifiedServerHTTPSProxyPropagatesUpstreamError(t *testing.T) {
 	cfg := &config.Config{
 		ListenAddress: "127.0.0.1:0",
 		ProxyMode:     "all",
-		CDNRules: []config.CDNRule{
-			{
-				Domain:        upstreamURL.Hostname(),
-				MatchPattern:  ".*",
-				DedupStrategy: "full_url",
-			},
-		},
 	}
 
-	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, nil, db)
+	ruleList := []config.CacheRule{
+		{
+			Name:          "upstream-cache",
+			Scope:         "request_only",
+			Expr:          "host contains \"" + upstreamURL.Hostname() + "\"",
+			Action:        "cache",
+			DedupStrategy: "full_url",
+			Priority:      100,
+		},
+	}
+	rulesEngine, err := rules.NewEngine(ruleList)
+	if err != nil {
+		t.Fatalf("Failed to compile cache rules: %v", err)
+	}
+
+	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, nil, db, rulesEngine)
 	if err != nil {
 		t.Fatalf("Failed to create unified server: %v", err)
 	}

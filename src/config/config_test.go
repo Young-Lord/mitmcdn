@@ -37,8 +37,8 @@ func TestParseSize(t *testing.T) {
 
 func TestParseDuration(t *testing.T) {
 	tests := []struct {
-		input    string
-		wantErr  bool
+		input   string
+		wantErr bool
 	}{
 		{"72h", false},
 		{"24h", false}, // 1 day as 24h
@@ -70,17 +70,13 @@ func TestLoadConfig(t *testing.T) {
 	configContent := `
 listen_address = "127.0.0.1:8081"
 proxy_mode = "http"
+cache_rules_dir = "./rules.d"
 
 [cache]
 cache_dir = "/tmp/test-cache"
 max_file_size = "1G"
 max_total_size = "10G"
 ttl = "24h"
-
-[[cdn_rules]]
-domain = "test-cdn.com"
-match_pattern = "\\.mp4$"
-dedup_strategy = "filename_only"
 `
 
 	if _, err := tmpFile.WriteString(configContent); err != nil {
@@ -102,12 +98,8 @@ dedup_strategy = "filename_only"
 		t.Errorf("ProxyMode = %q, want %q", cfg.ProxyMode, "http")
 	}
 
-	if len(cfg.CDNRules) != 1 {
-		t.Errorf("CDNRules length = %d, want 1", len(cfg.CDNRules))
-	}
-
-	if cfg.CDNRules[0].Domain != "test-cdn.com" {
-		t.Errorf("CDNRules[0].Domain = %q, want %q", cfg.CDNRules[0].Domain, "test-cdn.com")
+	if cfg.CacheRulesDir != "./rules.d" {
+		t.Errorf("CacheRulesDir = %q, want %q", cfg.CacheRulesDir, "./rules.d")
 	}
 }
 
@@ -143,6 +135,10 @@ func TestLoadConfigDefaults(t *testing.T) {
 
 	if cfg.Cache.MaxFileSize != "5G" {
 		t.Errorf("MaxFileSize default = %q, want %q", cfg.Cache.MaxFileSize, "5G")
+	}
+
+	if cfg.CacheRulesDir != "config/rules.d" {
+		t.Errorf("CacheRulesDir default = %q, want %q", cfg.CacheRulesDir, "config/rules.d")
 	}
 }
 

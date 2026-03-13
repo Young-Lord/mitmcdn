@@ -17,16 +17,22 @@ cp config.toml.example config.toml
 ```toml
 listen_address = "0.0.0.0:8081"
 proxy_mode = "all"
+cache_rules_dir = "./config/rules.d"
 
 [cache]
 cache_dir = "./data"
 max_file_size = "5G"
 max_total_size = "100G"
 ttl = "72h"
+```
 
-[[cdn_rules]]
-domain = "your-cdn-domain.com"
-match_pattern = "\\.(mp4|exe|zip)$"
+在 `config/rules.d` 下新增规则文件，例如 `config/rules.d/cdn.toml`：
+
+```toml
+name = "cdn-cache"
+scope = "request_only"
+expr = 'host contains "your-cdn-domain.com" && path matches "\\.(mp4|exe|zip)$"'
+action = "cache"
 dedup_strategy = "filename_only"
 ```
 
@@ -97,8 +103,8 @@ http://127.0.0.1:8083/https://your-cdn.com/video.mp4
 - 检查上游代理配置（如果使用）
 
 ### 缓存不工作
-- 检查 CDN 规则是否匹配目标域名
-- 检查 `match_pattern` 正则表达式是否正确
+- 检查规则是否命中目标域名/路径
+- 检查规则 `expr` 是否正确
 - 查看日志输出
 
 ## 高级配置
@@ -109,16 +115,24 @@ http://127.0.0.1:8083/https://your-cdn.com/video.mp4
 upstream_proxy = "socks5://127.0.0.1:1080"
 ```
 
-### 多个 CDN 规则
+### 多个规则文件
+
+`config/rules.d/cdn1.toml`
 
 ```toml
-[[cdn_rules]]
-domain = "cdn1.httpbin.org"
-match_pattern = "\\.mp4$"
+name = "cdn1"
+scope = "request_only"
+expr = 'host contains "cdn1.httpbin.org" && path matches "\\.mp4$"'
+action = "cache"
 dedup_strategy = "filename_only"
+```
 
-[[cdn_rules]]
-domain = "cdn2.httpbin.org"
-match_pattern = "\\.(exe|zip)$"
+`config/rules.d/cdn2.toml`
+
+```toml
+name = "cdn2"
+scope = "request_only"
+expr = 'host contains "cdn2.httpbin.org" && path matches "\\.(exe|zip)$"'
+action = "cache"
 dedup_strategy = "full_url"
 ```

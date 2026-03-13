@@ -12,27 +12,31 @@ import (
 
 // File represents a cached file metadata
 type File struct {
-	ID             uint      `gorm:"primaryKey"`
-	FileHash       string    `gorm:"uniqueIndex;not null"` // Deduplication fingerprint
-	OriginalURL    string    `gorm:"not null"`
-	RequestCookie  string    `gorm:"type:text"` // Cookie used for authentication
-	Filename       string    `gorm:"not null"`
-	FileSize       int64     `gorm:"not null"`
-	SavedPath      string    `gorm:"not null"`
-	ContentType    string    `gorm:"type:text"` // MIME type from upstream
-	DownloadStatus string    `gorm:"not null;default:'pending'"` // pending, downloading, complete, failed
-	CreatedAt      time.Time `gorm:"autoCreateTime"`
-	LastAccessedAt time.Time `gorm:"autoUpdateTime"`
-	CompletedAt    *time.Time // nil if not completed
-	DownloadedBytes int64     `gorm:"default:0"` // For resume support
+	ID                 uint       `gorm:"primaryKey"`
+	FileHash           string     `gorm:"uniqueIndex;not null"` // Deduplication fingerprint
+	CacheKey           string     `gorm:"type:text"`            // Optional cache key override
+	OriginalURL        string     `gorm:"not null"`
+	RequestCookie      string     `gorm:"type:text"` // Cookie used for authentication
+	Filename           string     `gorm:"not null"`
+	FileSize           int64      `gorm:"not null"`
+	SavedPath          string     `gorm:"not null"`
+	ContentType        string     `gorm:"type:text"`                  // MIME type from upstream
+	DownloadStatus     string     `gorm:"not null;default:'pending'"` // pending, downloading, complete, failed
+	CreatedAt          time.Time  `gorm:"autoCreateTime"`
+	LastAccessedAt     time.Time  `gorm:"autoUpdateTime"`
+	CompletedAt        *time.Time // nil if not completed
+	DownloadedBytes    int64      `gorm:"default:0"` // For resume support
+	TTLOverrideSeconds int64      `gorm:"default:0"` // Per-file TTL override in seconds
+	MaxSize            int64      `gorm:"default:0"` // Per-file max size limit
+	RuleName           string     `gorm:"type:text"`
 }
 
 // Log represents system logs
 type Log struct {
-	ID        uint      `gorm:"primaryKey"`
-	Level     string    `gorm:"not null"` // info, warn, error
-	Message   string    `gorm:"type:text;not null"`
-	URL       string    `gorm:"type:text"`
+	ID        uint   `gorm:"primaryKey"`
+	Level     string `gorm:"not null"` // info, warn, error
+	Message   string `gorm:"type:text;not null"`
+	URL       string `gorm:"type:text"`
 	FileHash  string
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 }

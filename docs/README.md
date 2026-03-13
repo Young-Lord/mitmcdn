@@ -77,14 +77,15 @@ go build -o mitmcdn
 - `url_path`: URL 路径代理模式（如 `http://server:8081/https://cdn.com/file.exe`）
 - `all`: 同时启用所有模式
 
-### CDN 规则
+### 缓存规则（Expr）
+
+缓存规则从目录加载，每个规则对应一个 TOML 文件：
 
 ```toml
-[[cdn_rules]]
-domain = "origin.cdn.com"
-match_pattern = "\\.(mp4|exe|zip)$"  # URL 正则表达式
-dedup_strategy = "filename_only"     # 去重策略：full_url 或 filename_only
+cache_rules_dir = "./config/rules.d"
 ```
+
+规则与示例见：`docs/CACHE_RULES.md`。
 
 ### 缓存配置
 

@@ -14,6 +14,10 @@ upstream_proxy = ""
 # Files in this directory will be served when URL is invalid or file not found
 assets_dir = "./assets"
 
+# Cache rules configuration
+# Each rule is a TOML file inside this directory
+cache_rules_dir = "./config/rules.d"
+
 # Cache configuration
 [cache]
 cache_dir = "./data"
@@ -21,19 +25,7 @@ max_file_size = "5G"       # Maximum size for a single file
 max_total_size = "100G"   # Total cache pool size limit (triggers LRU eviction)
 ttl = "72h"               # Cache file expiration time
 
-# CDN interception rules
-[[cdn_rules]]
-domain = "httpbin.org"
-# URL regex pattern to match files
-match_pattern = ""
-# Deduplication strategy: full_url (entire URL) or filename_only (filename only)
-dedup_strategy = "full_url"
-
-# Example: Another CDN rule
-# [[cdn_rules]]
-# domain = "another-cdn.example.com"
-# match_pattern = "\\.(mp4|mkv|avi)$"
-# dedup_strategy = "full_url"
+# Cache rules live in config/rules.d/*.toml
 
 # HTML rewrite plugins
 # - Place plugin entry files in ./plugins/*.ts
@@ -44,4 +36,3 @@ dedup_strategy = "full_url"
 #
 # yt-dlp command is configured in that plugin config:
 #   yt_dlp_command = ["yt-dlp", "--cookies-from-browser", "firefox"]
-

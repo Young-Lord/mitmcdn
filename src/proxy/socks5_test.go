@@ -18,6 +18,7 @@ import (
 	"mitmcdn/src/config"
 	"mitmcdn/src/database"
 	"mitmcdn/src/download"
+	"mitmcdn/src/rules"
 
 	"golang.org/x/net/proxy"
 	"gorm.io/driver/sqlite"
@@ -36,10 +37,13 @@ func TestSOCKS5ProxyMITMCachesHTTPRequests(t *testing.T) {
 		t.Fatalf("failed to parse origin URL: %v", err)
 	}
 
-	proxyAddr, db, cleanup := setupSOCKS5ProxyForTest(t, []config.CDNRule{{
-		Domain:        originURL.Hostname(),
-		MatchPattern:  ".*",
+	proxyAddr, db, cleanup := setupSOCKS5ProxyForTest(t, []config.CacheRule{{
+		Name:          "origin-cache",
+		Scope:         "request_only",
+		Expr:          "host contains \"" + originURL.Hostname() + "\"",
+		Action:        "cache",
 		DedupStrategy: "full_url",
+		Priority:      100,
 	}})
 	defer cleanup()
 
@@ -93,10 +97,13 @@ func TestSOCKS5ProxyMITMCachesHTTPSRequests(t *testing.T) {
 		t.Fatalf("failed to parse origin URL: %v", err)
 	}
 
-	proxyAddr, db, cleanup := setupSOCKS5ProxyForTest(t, []config.CDNRule{{
-		Domain:        originURL.Hostname(),
-		MatchPattern:  ".*",
+	proxyAddr, db, cleanup := setupSOCKS5ProxyForTest(t, []config.CacheRule{{
+		Name:          "origin-cache",
+		Scope:         "request_only",
+		Expr:          "host contains \"" + originURL.Hostname() + "\"",
+		Action:        "cache",
 		DedupStrategy: "full_url",
+		Priority:      100,
 	}})
 	defer cleanup()
 
@@ -125,7 +132,7 @@ func TestSOCKS5ProxyMITMCachesHTTPSRequests(t *testing.T) {
 	}
 }
 
-func setupSOCKS5ProxyForTest(t *testing.T, rules []config.CDNRule) (string, *gorm.DB, func()) {
+func setupSOCKS5ProxyForTest(t *testing.T, rulesList []config.CacheRule) (string, *gorm.DB, func()) {
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "proxy-test.db")
@@ -156,11 +163,14 @@ func setupSOCKS5ProxyForTest(t *testing.T, rules []config.CDNRule) (string, *gor
 		t.Fatalf("failed to create scheduler: %v", err)
 	}
 
-	cfg := &config.Config{
-		CDNRules: rules,
+	rulesEngine, err := rules.NewEngine(rulesList)
+	if err != nil {
+		t.Fatalf("failed to compile cache rules: %v", err)
 	}
 
-	mitm := NewMITMProxy(cfg, cacheMgr, sched, nil)
+	cfg := &config.Config{}
+
+	mitm := NewMITMProxy(cfg, cacheMgr, sched, nil, rulesEngine)
 	socksProxy, err := NewSOCKS5Proxy(cfg, cacheMgr, sched, mitm)
 	if err != nil {
 		t.Fatalf("failed to create SOCKS5 proxy: %v", err)

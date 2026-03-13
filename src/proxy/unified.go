@@ -20,6 +20,7 @@ import (
 	"mitmcdn/src/database"
 	"mitmcdn/src/download"
 	"mitmcdn/src/htmlplugin"
+	"mitmcdn/src/rules"
 
 	"gorm.io/gorm"
 )
@@ -38,9 +39,9 @@ type UnifiedServer struct {
 }
 
 // NewUnifiedServer creates a unified server that can handle multiple protocols
-func NewUnifiedServer(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, htmlPlugins *htmlplugin.Manager, db *gorm.DB) (*UnifiedServer, error) {
-	mitmProxy := NewMITMProxy(cfg, cacheMgr, sched, htmlPlugins)
-	reverseProxy := NewHTTPReverseProxy(cfg, cacheMgr, sched, mitmProxy, htmlPlugins)
+func NewUnifiedServer(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, htmlPlugins *htmlplugin.Manager, db *gorm.DB, rulesEngine *rules.Engine) (*UnifiedServer, error) {
+	mitmProxy := NewMITMProxy(cfg, cacheMgr, sched, htmlPlugins, rulesEngine)
+	reverseProxy := NewHTTPReverseProxy(cfg, cacheMgr, sched, mitmProxy, htmlPlugins, rulesEngine)
 
 	var socks5Proxy *SOCKS5Proxy
 	var err error

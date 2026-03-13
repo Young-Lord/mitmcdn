@@ -13,6 +13,7 @@ import (
 	"mitmcdn/src/config"
 	"mitmcdn/src/download"
 	"mitmcdn/src/htmlplugin"
+	"mitmcdn/src/rules"
 )
 
 type HTTPReverseProxy struct {
@@ -21,15 +22,17 @@ type HTTPReverseProxy struct {
 	downloadSched *download.Scheduler
 	mitmProxy     *MITMProxy
 	htmlPlugins   *htmlplugin.Manager
+	rulesEngine   *rules.Engine
 }
 
-func NewHTTPReverseProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, mitm *MITMProxy, htmlPlugins *htmlplugin.Manager) *HTTPReverseProxy {
+func NewHTTPReverseProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, mitm *MITMProxy, htmlPlugins *htmlplugin.Manager, rulesEngine *rules.Engine) *HTTPReverseProxy {
 	return &HTTPReverseProxy{
 		config:        cfg,
 		cacheManager:  cacheMgr,
 		downloadSched: sched,
 		mitmProxy:     mitm,
 		htmlPlugins:   htmlPlugins,
+		rulesEngine:   rulesEngine,
 	}
 }
 
@@ -77,10 +80,27 @@ func (p *HTTPReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this matches any CDN rule
-	rule := p.findMatchingRule(targetURL.String(), targetURL.Host)
-	if rule == nil {
-		// Not a CDN file, forward to upstream
+	decision, matched, err := p.evaluateCacheRule(r, targetURL)
+	if err != nil {
+		logErrorWithStack(err, "Rule evaluation failed: %s", targetURL.String())
+		p.forwardRequest(w, r, targetURL)
+		return
+	}
+	if !matched {
+		p.forwardRequest(w, r, targetURL)
+		return
+	}
+
+	switch decision.Action {
+	case rules.ActionDeny:
+		http.Error(w, "Denied by cache rules", http.StatusForbidden)
+		return
+	case rules.ActionBypass:
+		p.forwardRequest(w, r, targetURL)
+		return
+	case rules.ActionCache:
+		// continue
+	default:
 		p.forwardRequest(w, r, targetURL)
 		return
 	}
@@ -92,11 +112,17 @@ func (p *HTTPReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	filename := p.extractFilename(targetURL.Path)
 
 	// Get or create file entry
-	file, err := p.cacheManager.GetOrCreateFile(
+	file, err := p.cacheManager.GetOrCreateFileWithOptions(
 		targetURL.String(),
 		cookie,
 		filename,
-		rule.DedupStrategy,
+		cache.FileOptions{
+			CacheKey:      decision.CacheKey,
+			DedupStrategy: decision.DedupStrategy,
+			TTLOverride:   decision.TTLOverride,
+			MaxSize:       decision.MaxSize,
+			RuleName:      decision.RuleName,
+		},
 	)
 	if err != nil {
 		logErrorWithStack(err, "Failed to get or create file: %s", targetURL.String())
@@ -112,20 +138,10 @@ func (p *HTTPReverseProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stream file (will trigger download if needed)
-	if err := p.downloadSched.StreamFile(file, w, r); err != nil {
+	if err := p.downloadSched.StreamFile(file, w, r, decision.Priority); err != nil {
 		logErrorWithStack(err, "Failed to stream file: %s", targetURL.String())
 		// Error already sent to client by StreamFile
 	}
-}
-
-// findMatchingRule finds matching CDN rule
-func (p *HTTPReverseProxy) findMatchingRule(urlStr, host string) *config.CDNRule {
-	for _, rule := range p.config.CDNRules {
-		if cache.MatchCDNRule(urlStr, rule.Domain, rule.MatchPattern) {
-			return &rule
-		}
-	}
-	return nil
 }
 
 // extractFilename extracts filename from URL path

@@ -1,0 +1,6 @@
+name = "httpbin-cache"
+scope = "request_only"
+expr = 'host contains "httpbin.org" && method == "GET"'
+action = "cache"
+dedup_strategy = "full_url"
+priority = 100

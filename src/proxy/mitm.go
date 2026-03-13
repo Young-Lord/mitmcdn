@@ -18,6 +18,7 @@ import (
 	"mitmcdn/src/config"
 	"mitmcdn/src/download"
 	"mitmcdn/src/htmlplugin"
+	"mitmcdn/src/rules"
 )
 
 type MITMProxy struct {
@@ -25,15 +26,17 @@ type MITMProxy struct {
 	cacheManager  *cache.Manager
 	downloadSched *download.Scheduler
 	htmlPlugins   *htmlplugin.Manager
+	rulesEngine   *rules.Engine
 	certCache     sync.Map // host -> *tls.Certificate
 }
 
-func NewMITMProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, htmlPlugins *htmlplugin.Manager) *MITMProxy {
+func NewMITMProxy(cfg *config.Config, cacheMgr *cache.Manager, sched *download.Scheduler, htmlPlugins *htmlplugin.Manager, rulesEngine *rules.Engine) *MITMProxy {
 	return &MITMProxy{
 		config:        cfg,
 		cacheManager:  cacheMgr,
 		downloadSched: sched,
 		htmlPlugins:   htmlPlugins,
+		rulesEngine:   rulesEngine,
 	}
 }
 
@@ -196,10 +199,27 @@ func (w *tlsResponseWriter) Close() error {
 
 // processRequestWithWriter processes a request with a proper ResponseWriter
 func (p *MITMProxy) processRequestWithWriter(r *http.Request, w http.ResponseWriter) {
-	// Check CDN rules
-	rule := p.findMatchingRule(r.URL.String(), r.Host)
-	if rule == nil {
-		// Not a CDN file, forward normally
+	decision, matched, err := p.evaluateCacheRule(r, r.URL)
+	if err != nil {
+		logErrorWithStack(err, "Rule evaluation failed: %s", r.URL.String())
+		p.forwardHTTP(w, r)
+		return
+	}
+	if !matched {
+		p.forwardHTTP(w, r)
+		return
+	}
+
+	switch decision.Action {
+	case rules.ActionDeny:
+		http.Error(w, "Denied by cache rules", http.StatusForbidden)
+		return
+	case rules.ActionBypass:
+		p.forwardHTTP(w, r)
+		return
+	case rules.ActionCache:
+		// continue
+	default:
 		p.forwardHTTP(w, r)
 		return
 	}
@@ -211,11 +231,17 @@ func (p *MITMProxy) processRequestWithWriter(r *http.Request, w http.ResponseWri
 	filename := p.extractFilename(r.URL.Path)
 
 	// Get or create file entry
-	file, err := p.cacheManager.GetOrCreateFile(
+	file, err := p.cacheManager.GetOrCreateFileWithOptions(
 		r.URL.String(),
 		cookie,
 		filename,
-		rule.DedupStrategy,
+		cache.FileOptions{
+			CacheKey:      decision.CacheKey,
+			DedupStrategy: decision.DedupStrategy,
+			TTLOverride:   decision.TTLOverride,
+			MaxSize:       decision.MaxSize,
+			RuleName:      decision.RuleName,
+		},
 	)
 	if err != nil {
 		// Log error with stack trace and forward
@@ -232,7 +258,7 @@ func (p *MITMProxy) processRequestWithWriter(r *http.Request, w http.ResponseWri
 	}
 
 	// Stream file (will trigger download if needed)
-	if err := p.downloadSched.StreamFile(file, w, r); err != nil {
+	if err := p.downloadSched.StreamFile(file, w, r, decision.Priority); err != nil {
 		logErrorWithStack(err, "Failed to stream file: %s", r.URL.String())
 		// Error already sent to client by StreamFile
 	}
@@ -263,10 +289,27 @@ func (p *MITMProxy) handleHTTPRequest(w http.ResponseWriter, r *http.Request) {
 
 // processRequest processes intercepted requests
 func (p *MITMProxy) processRequest(r *http.Request, w io.Writer) {
-	// Check CDN rules
-	rule := p.findMatchingRule(r.URL.String(), r.Host)
-	if rule == nil {
-		// Not a CDN file, forward normally
+	decision, matched, err := p.evaluateCacheRule(r, r.URL)
+	if err != nil {
+		logErrorWithStack(err, "Rule evaluation failed: %s", r.URL.String())
+		p.forwardHTTP(w.(http.ResponseWriter), r)
+		return
+	}
+	if !matched {
+		p.forwardHTTP(w.(http.ResponseWriter), r)
+		return
+	}
+
+	switch decision.Action {
+	case rules.ActionDeny:
+		http.Error(w.(http.ResponseWriter), "Denied by cache rules", http.StatusForbidden)
+		return
+	case rules.ActionBypass:
+		p.forwardHTTP(w.(http.ResponseWriter), r)
+		return
+	case rules.ActionCache:
+		// continue
+	default:
 		p.forwardHTTP(w.(http.ResponseWriter), r)
 		return
 	}
@@ -278,11 +321,17 @@ func (p *MITMProxy) processRequest(r *http.Request, w io.Writer) {
 	filename := p.extractFilename(r.URL.Path)
 
 	// Get or create file entry
-	file, err := p.cacheManager.GetOrCreateFile(
+	file, err := p.cacheManager.GetOrCreateFileWithOptions(
 		r.URL.String(),
 		cookie,
 		filename,
-		rule.DedupStrategy,
+		cache.FileOptions{
+			CacheKey:      decision.CacheKey,
+			DedupStrategy: decision.DedupStrategy,
+			TTLOverride:   decision.TTLOverride,
+			MaxSize:       decision.MaxSize,
+			RuleName:      decision.RuleName,
+		},
 	)
 	if err != nil {
 		// Log error with stack trace and forward
@@ -300,7 +349,7 @@ func (p *MITMProxy) processRequest(r *http.Request, w io.Writer) {
 
 	// Stream file (will trigger download if needed)
 	if httpWriter, ok := w.(http.ResponseWriter); ok {
-		if err := p.downloadSched.StreamFile(file, httpWriter, r); err != nil {
+		if err := p.downloadSched.StreamFile(file, httpWriter, r, decision.Priority); err != nil {
 			logErrorWithStack(err, "Failed to stream file: %s", r.URL.String())
 			// Error already sent to client by StreamFile
 		}
@@ -309,22 +358,10 @@ func (p *MITMProxy) processRequest(r *http.Request, w io.Writer) {
 
 // shouldIntercept checks if host should be intercepted
 func (p *MITMProxy) shouldIntercept(host string) bool {
-	for _, rule := range p.config.CDNRules {
-		if strings.Contains(host, rule.Domain) {
-			return true
-		}
+	if p.rulesEngine == nil {
+		return false
 	}
-	return false
-}
-
-// findMatchingRule finds matching CDN rule
-func (p *MITMProxy) findMatchingRule(urlStr, host string) *config.CDNRule {
-	for _, rule := range p.config.CDNRules {
-		if cache.MatchCDNRule(urlStr, rule.Domain, rule.MatchPattern) {
-			return &rule
-		}
-	}
-	return nil
+	return p.rulesEngine.HasRules()
 }
 
 // extractFilename extracts filename from URL path

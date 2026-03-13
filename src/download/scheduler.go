@@ -82,6 +82,12 @@ func NewSchedulerWithClient(cacheManager *cache.Manager, db *gorm.DB, upstreamPr
 	}, nil
 }
 
+func (s *Scheduler) HTTPClient() *http.Client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.httpClient
+}
+
 func (s *Scheduler) ConfigureYTDLPCommand(command []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -290,6 +296,12 @@ func (s *Scheduler) downloadTask(task *Task) {
 		s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(updates)
 	}
 
+	if task.file.MaxSize > 0 && totalSize > 0 && totalSize > task.file.MaxSize {
+		s.handleDownloadError(task, fmt.Errorf("file size %d exceeds max size %d", totalSize, task.file.MaxSize))
+		_ = os.Remove(task.file.SavedPath)
+		return
+	}
+
 	// Download with pause/resume support
 	buffer := make([]byte, 32*1024) // 32KB buffer
 	downloaded := startOffset
@@ -310,6 +322,11 @@ func (s *Scheduler) downloadTask(task *Task) {
 		default:
 			n, err := resp.Body.Read(buffer)
 			if n > 0 {
+				if task.file.MaxSize > 0 && downloaded+int64(n) > task.file.MaxSize {
+					s.handleDownloadError(task, fmt.Errorf("download exceeded max size %d", task.file.MaxSize))
+					_ = os.Remove(task.file.SavedPath)
+					return
+				}
 				data := make([]byte, n)
 				copy(data, buffer[:n])
 
@@ -500,7 +517,7 @@ func (s *Scheduler) closeTaskDataChan(task *Task) {
 
 // StreamFile streams a file to client while downloading (if not complete)
 // Implements "stream tapping" - downloads from upstream while streaming to client
-func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *http.Request) error {
+func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *http.Request, priority int) error {
 	// If file is complete, serve directly
 	if file.DownloadStatus == "complete" {
 		http.ServeFile(w, r, file.SavedPath)
@@ -527,9 +544,12 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 	}
 
 	if needsStart {
+		if priority == 0 {
+			priority = 100
+		}
 		// Start download with high priority (don't hold lock to avoid deadlock)
-		s.PauseLowPriorityTasks(100)
-		if err := s.StartDownload(file, file.OriginalURL, file.RequestCookie, 100); err != nil {
+		s.PauseLowPriorityTasks(priority)
+		if err := s.StartDownload(file, file.OriginalURL, file.RequestCookie, priority); err != nil {
 			return fmt.Errorf("failed to start download: %w", err)
 		}
 		// Get the task we just created

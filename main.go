@@ -15,6 +15,7 @@ import (
 	"mitmcdn/src/download"
 	"mitmcdn/src/htmlplugin"
 	"mitmcdn/src/proxy"
+	"mitmcdn/src/rules"
 )
 
 var (
@@ -68,6 +69,16 @@ func main() {
 		log.Fatalf("Failed to initialize download scheduler: %v", err)
 	}
 
+	// Load cache rules
+	ruleList, err := config.LoadCacheRules(cfg.CacheRulesDir)
+	if err != nil {
+		log.Fatalf("Failed to load cache rules: %v", err)
+	}
+	rulesEngine, err := rules.NewEngine(ruleList)
+	if err != nil {
+		log.Fatalf("Failed to compile cache rules: %v", err)
+	}
+
 	// Initialize HTML rewrite plugins
 	htmlPluginManager, err := htmlplugin.NewManager("plugins", "configs", cacheMgr, downloadSched)
 	if err != nil {
@@ -82,7 +93,7 @@ func main() {
 	go startCleanup(ctx, cacheMgr, maxTotalSize)
 
 	// Start unified server that handles all protocols on a single port
-	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, htmlPluginManager, db)
+	unifiedServer, err := proxy.NewUnifiedServer(cfg, cacheMgr, downloadSched, htmlPluginManager, db, rulesEngine)
 	if err != nil {
 		log.Fatalf("Failed to create unified server: %v", err)
 	}

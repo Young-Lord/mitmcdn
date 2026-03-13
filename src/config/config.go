@@ -14,7 +14,7 @@ type Config struct {
 	UpstreamProxy string      `toml:"upstream_proxy"`
 	AssetsDir     string      `toml:"assets_dir"` // Fallback assets directory
 	Cache         CacheConfig `toml:"cache"`
-	CDNRules      []CDNRule   `toml:"cdn_rules"`
+	CacheRulesDir string      `toml:"cache_rules_dir"`
 }
 
 type CacheConfig struct {
@@ -22,13 +22,6 @@ type CacheConfig struct {
 	MaxFileSize  string `toml:"max_file_size"`
 	MaxTotalSize string `toml:"max_total_size"`
 	TTL          string `toml:"ttl"`
-}
-
-type CDNRule struct {
-	Domain         string `toml:"domain"`
-	MatchPattern   string `toml:"match_pattern"`   // URL regex pattern
-	DedupStrategy  string `toml:"dedup_strategy"`  // full_url or filename_only
-	RequestCookie  string `toml:"request_cookie,omitempty"` // optional cookie for dedup
 }
 
 // LoadConfig loads configuration from a TOML file
@@ -64,6 +57,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if config.AssetsDir == "" {
 		config.AssetsDir = "./assets"
+	}
+	if config.CacheRulesDir == "" {
+		config.CacheRulesDir = "config/rules.d"
 	}
 
 	return &config, nil

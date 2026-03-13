@@ -89,54 +89,6 @@ func TestComputeFileHash(t *testing.T) {
 	}
 }
 
-func TestMatchCDNRule(t *testing.T) {
-	tests := []struct {
-		name    string
-		url     string
-		domain  string
-		pattern string
-		want    bool
-	}{
-		{
-			name:    "matches domain and pattern",
-			url:     "https://cdn.httpbin.org/video.mp4",
-			domain:  "cdn.httpbin.org",
-			pattern: "\\.mp4$",
-			want:    true,
-		},
-		{
-			name:    "matches domain but not pattern",
-			url:     "https://cdn.httpbin.org/page.html",
-			domain:  "cdn.httpbin.org",
-			pattern: "\\.mp4$",
-			want:    false,
-		},
-		{
-			name:    "does not match domain",
-			url:     "https://other.com/video.mp4",
-			domain:  "cdn.httpbin.org",
-			pattern: "\\.mp4$",
-			want:    false,
-		},
-		{
-			name:    "matches domain without pattern",
-			url:     "https://cdn.httpbin.org/anyfile",
-			domain:  "cdn.httpbin.org",
-			pattern: "",
-			want:    true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := MatchCDNRule(tt.url, tt.domain, tt.pattern)
-			if got != tt.want {
-				t.Errorf("MatchCDNRule() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestNewManager(t *testing.T) {
 	db := setupTestDB(t)
 	tmpDir := t.TempDir()

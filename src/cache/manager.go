@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +37,14 @@ type DownloadTask struct {
 	cancel     func() // context cancel function
 	pauseChan  chan struct{}
 	resumeChan chan struct{}
+}
+
+type FileOptions struct {
+	CacheKey      string
+	DedupStrategy string
+	TTLOverride   time.Duration
+	MaxSize       int64
+	RuleName      string
 }
 
 func NewManager(db *gorm.DB, cacheDir string, maxFileSize, maxTotalSize int64, ttl time.Duration) (*Manager, error) {
@@ -91,15 +98,52 @@ func (m *Manager) ComputeFileHash(url, cookie, strategy string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// ComputeFileHashFromKey computes deduplication hash based on a cache key.
+func (m *Manager) ComputeFileHashFromKey(key string) string {
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:])
+}
+
 // GetOrCreateFile gets existing file or creates a new entry
 func (m *Manager) GetOrCreateFile(url, cookie, filename, strategy string) (*database.File, error) {
-	fileHash := m.ComputeFileHash(url, cookie, strategy)
+	return m.GetOrCreateFileWithOptions(url, cookie, filename, FileOptions{DedupStrategy: strategy})
+}
+
+// GetOrCreateFileWithOptions gets existing file or creates a new entry with options.
+func (m *Manager) GetOrCreateFileWithOptions(url, cookie, filename string, opts FileOptions) (*database.File, error) {
+	strategy := opts.DedupStrategy
+	if strategy == "" {
+		strategy = "full_url"
+	}
+
+	fileHash := ""
+	if opts.CacheKey != "" {
+		fileHash = m.ComputeFileHashFromKey(opts.CacheKey)
+	} else {
+		fileHash = m.ComputeFileHash(url, cookie, strategy)
+	}
 
 	var file database.File
 	err := m.db.Where("file_hash = ?", fileHash).First(&file).Error
 	if err == nil {
-		// Update last accessed time
+		// Update last accessed time and rule fields
 		file.LastAccessedAt = time.Now()
+		updates := map[string]interface{}{}
+		if opts.CacheKey != "" {
+			updates["cache_key"] = opts.CacheKey
+		}
+		if opts.TTLOverride > 0 {
+			updates["ttl_override_seconds"] = int64(opts.TTLOverride.Seconds())
+		}
+		if opts.MaxSize > 0 {
+			updates["max_size"] = opts.MaxSize
+		}
+		if opts.RuleName != "" {
+			updates["rule_name"] = opts.RuleName
+		}
+		if len(updates) > 0 {
+			m.db.Model(&database.File{}).Where("file_hash = ?", fileHash).Updates(updates)
+		}
 		m.db.Save(&file)
 		return &file, nil
 	}
@@ -110,14 +154,18 @@ func (m *Manager) GetOrCreateFile(url, cookie, filename, strategy string) (*data
 
 	// Create new file entry
 	file = database.File{
-		FileHash:       fileHash,
-		OriginalURL:    url,
-		RequestCookie:  cookie,
-		Filename:       filename,
-		FileSize:       0, // Unknown initially
-		SavedPath:      filepath.Join(m.cacheDir, fileHash),
-		DownloadStatus: "pending",
-		LastAccessedAt: time.Now(),
+		FileHash:           fileHash,
+		CacheKey:           opts.CacheKey,
+		OriginalURL:        url,
+		RequestCookie:      cookie,
+		Filename:           filename,
+		FileSize:           0, // Unknown initially
+		SavedPath:          filepath.Join(m.cacheDir, fileHash),
+		DownloadStatus:     "pending",
+		LastAccessedAt:     time.Now(),
+		TTLOverrideSeconds: int64(opts.TTLOverride.Seconds()),
+		MaxSize:            opts.MaxSize,
+		RuleName:           opts.RuleName,
 	}
 
 	if err := m.db.Create(&file).Error; err != nil {
@@ -127,36 +175,23 @@ func (m *Manager) GetOrCreateFile(url, cookie, filename, strategy string) (*data
 	return &file, nil
 }
 
-// MatchCDNRule checks if URL matches any CDN rule
-func MatchCDNRule(url string, domain, pattern string) bool {
-	// Check domain
-	if !strings.Contains(url, domain) {
-		return false
-	}
-
-	// Check pattern if provided
-	if pattern != "" {
-		matched, err := regexp.MatchString(pattern, url)
-		if err != nil || !matched {
-			return false
-		}
-	}
-
-	return true
-}
-
 // CleanupExpiredFiles removes files older than TTL
 func (m *Manager) CleanupExpiredFiles() error {
-	cutoff := time.Now().Add(-m.ttl)
-
 	var files []database.File
-	if err := m.db.Where("last_accessed_at < ? AND download_status = ?", cutoff, "complete").Find(&files).Error; err != nil {
+	if err := m.db.Where("download_status = ?", "complete").Find(&files).Error; err != nil {
 		return err
 	}
 
+	now := time.Now()
 	for _, file := range files {
-		os.Remove(file.SavedPath)
-		m.db.Delete(&file)
+		ttl := m.ttl
+		if file.TTLOverrideSeconds > 0 {
+			ttl = time.Duration(file.TTLOverrideSeconds) * time.Second
+		}
+		if file.LastAccessedAt.Before(now.Add(-ttl)) {
+			os.Remove(file.SavedPath)
+			m.db.Delete(&file)
+		}
 	}
 
 	return nil
