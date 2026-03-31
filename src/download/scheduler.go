@@ -47,6 +47,7 @@ type Task struct {
 	closeOnce  sync.Once
 	streamMu   sync.RWMutex
 	streamers  []io.Writer // Active streamers (clients receiving data)
+	notifyCh   chan struct{}
 }
 
 func NewScheduler(cacheManager *cache.Manager, db *gorm.DB, upstreamProxy string) (*Scheduler, error) {
@@ -157,6 +158,7 @@ func (s *Scheduler) StartDownload(file *database.File, url, cookie string, prior
 		file:       file,
 		dataChan:   make(chan []byte, 10), // Buffered channel for streaming
 		streamers:  make([]io.Writer, 0),
+		notifyCh:   make(chan struct{}, 1),
 	}
 
 	s.tasks[file.FileHash] = task
@@ -210,6 +212,7 @@ func (s *Scheduler) downloadTask(task *Task) {
 	task.mu.Lock()
 	task.Status = "downloading"
 	task.mu.Unlock()
+	task.notify()
 
 	// Update database
 	s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(map[string]interface{}{
@@ -295,6 +298,7 @@ func (s *Scheduler) downloadTask(task *Task) {
 	if len(updates) > 0 {
 		s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(updates)
 	}
+	task.notify()
 
 	if task.file.MaxSize > 0 && totalSize > 0 && totalSize > task.file.MaxSize {
 		s.handleDownloadError(task, fmt.Errorf("file size %d exceeds max size %d", totalSize, task.file.MaxSize))
@@ -310,67 +314,69 @@ func (s *Scheduler) downloadTask(task *Task) {
 		select {
 		case <-task.ctx.Done():
 			return
-		case <-task.pauseChan:
-			task.mu.Lock()
-			task.Status = "paused"
-			task.mu.Unlock()
-			// Wait for resume
-			<-task.resumeChan
-			task.mu.Lock()
-			task.Status = "downloading"
-			task.mu.Unlock()
 		default:
-			n, err := resp.Body.Read(buffer)
-			if n > 0 {
-				if task.file.MaxSize > 0 && downloaded+int64(n) > task.file.MaxSize {
-					s.handleDownloadError(task, fmt.Errorf("download exceeded max size %d", task.file.MaxSize))
-					_ = os.Remove(task.file.SavedPath)
-					return
-				}
-				data := make([]byte, n)
-				copy(data, buffer[:n])
+		}
 
-				// Write to file
-				if _, writeErr := file.Write(data); writeErr != nil {
-					s.handleDownloadError(task, writeErr)
-					return
-				}
+		n, err := resp.Body.Read(buffer)
+		if n > 0 {
+			if task.file.MaxSize > 0 && downloaded+int64(n) > task.file.MaxSize {
+				s.handleDownloadError(task, fmt.Errorf("download exceeded max size %d", task.file.MaxSize))
+				_ = os.Remove(task.file.SavedPath)
+				return
+			}
+			data := make([]byte, n)
+			copy(data, buffer[:n])
 
-				// Send to channel for all streamers
+			if _, writeErr := file.Write(data); writeErr != nil {
+				s.handleDownloadError(task, writeErr)
+				return
+			}
+
+			sent := false
+			for !sent {
 				select {
 				case task.dataChan <- data:
-				default:
-					// Channel full, skip (streamers will read from file via ticker)
+					sent = true
+				case <-task.ctx.Done():
+					return
+				case <-task.pauseChan:
+					task.mu.Lock()
+					task.Status = "paused"
+					task.mu.Unlock()
+					task.notify()
+					<-task.resumeChan
+					task.mu.Lock()
+					task.Status = "downloading"
+					task.mu.Unlock()
+					task.notify()
 				}
-
-				downloaded += int64(n)
-
-				// Update progress in database periodically
-				if downloaded%1024*1024 == 0 { // Every MB
-					s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Update("downloaded_bytes", downloaded)
-				}
 			}
-			if err == io.EOF {
-				// Download complete
-				now := time.Now()
-				s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(map[string]interface{}{
-					"download_status":  "complete",
-					"downloaded_bytes": downloaded,
-					"completed_at":     &now,
-				})
 
-				task.mu.Lock()
-				task.Status = "complete"
-				task.mu.Unlock()
+			downloaded += int64(n)
 
-				// Close data channel to signal streamers
-				s.closeTaskDataChan(task)
-				return
+			if downloaded%(1024*1024) == 0 { // Every MB
+				s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Update("downloaded_bytes", downloaded)
 			}
-			if err != nil {
-				s.handleDownloadError(task, err)
-				return
-			}
+		}
+		if err == io.EOF {
+			now := time.Now()
+			s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Updates(map[string]interface{}{
+				"download_status":  "complete",
+				"downloaded_bytes": downloaded,
+				"completed_at":     &now,
+			})
+
+			task.mu.Lock()
+			task.Status = "complete"
+			task.mu.Unlock()
+			task.notify()
+
+			s.closeTaskDataChan(task)
+			return
+		}
+		if err != nil {
+			s.handleDownloadError(task, err)
+			return
 		}
 	}
 }
@@ -484,6 +490,7 @@ func (s *Scheduler) downloadYTDLPTask(task *Task, videoID string) {
 	task.file.ContentType = contentType
 	task.file.FileSize = info.Size()
 	task.mu.Unlock()
+	task.notify()
 
 	s.closeTaskDataChan(task)
 }
@@ -493,6 +500,7 @@ func (s *Scheduler) handleDownloadError(task *Task, err error) {
 	task.Status = "failed"
 	task.mu.Unlock()
 	s.closeTaskDataChan(task)
+	task.notify()
 
 	s.db.Model(&database.File{}).Where("file_hash = ?", task.FileHash).Update("download_status", "failed")
 
@@ -513,6 +521,31 @@ func (s *Scheduler) closeTaskDataChan(task *Task) {
 	task.closeOnce.Do(func() {
 		close(task.dataChan)
 	})
+}
+
+func (t *Task) notify() {
+	select {
+	case t.notifyCh <- struct{}{}:
+	default:
+	}
+}
+
+func (t *Task) waitUntil(timeout time.Duration, check func() bool) bool {
+	if check() {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-timer.C:
+			return check()
+		case <-t.notifyCh:
+			if check() {
+				return true
+			}
+		}
+	}
 }
 
 // StreamFile streams a file to client while downloading (if not complete)
@@ -570,67 +603,48 @@ func (s *Scheduler) StreamFile(file *database.File, w http.ResponseWriter, r *ht
 		f.Close() // Close and reopen later if needed
 	}
 
-	// Wait for task to be ready (with timeout)
-	timeout := time.After(5 * time.Second)
-	ready := false
-	for !ready {
-		select {
-		case <-timeout:
-			// Timeout - check if we have any content to serve
-			if currentSize > 0 {
-				// We have some content, serve it even if download hasn't started
-				ready = true
-				break
-			}
-			// No content, return error
-			return fmt.Errorf("timeout waiting for download to start")
-		default:
-			task.mu.Lock()
-			status := task.Status
-			task.mu.Unlock()
-			if status == "failed" {
-				if currentSize == 0 {
-					return s.writeDownloadError(w, file.FileHash)
-				}
-				ready = true
-				break
-			}
-			if status == "downloading" || status == "complete" {
-				ready = true
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}
-
-	// Wait for ContentType and FileSize to be set by download task
-	// Use in-memory task.file instead of polling database
-	maxWait := 20
-	for i := 0; i < maxWait; i++ {
-		task.mu.Lock()
-		status := task.Status
-		contentType := task.file.ContentType
-		fileSize := task.file.FileSize
-		task.mu.Unlock()
-
-		if status == "failed" && currentSize == 0 {
-			return s.writeDownloadError(w, file.FileHash)
-		}
-
-		if contentType != "" {
-			// Update the file parameter with values from task
-			file.ContentType = contentType
-			file.FileSize = fileSize
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
+	// Wait for task to be ready (downloading or complete)
 	task.mu.Lock()
 	status := task.Status
 	task.mu.Unlock()
+	if status != "downloading" && status != "complete" && status != "failed" {
+		if !task.waitUntil(5*time.Second, func() bool {
+			task.mu.Lock()
+			s := task.Status
+			task.mu.Unlock()
+			return s == "downloading" || s == "complete" || s == "failed"
+		}) && currentSize == 0 {
+			return fmt.Errorf("timeout waiting for download to start")
+		}
+	}
+
+	task.mu.Lock()
+	status = task.Status
+	task.mu.Unlock()
 	if status == "failed" && currentSize == 0 {
 		return s.writeDownloadError(w, file.FileHash)
+	}
+
+	// Wait for ContentType and FileSize to be set by download task
+	task.waitUntil(time.Second, func() bool {
+		task.mu.Lock()
+		ct := task.file.ContentType
+		task.mu.Unlock()
+		return ct != ""
+	})
+
+	task.mu.Lock()
+	status = task.Status
+	ct := task.file.ContentType
+	fs := task.file.FileSize
+	task.mu.Unlock()
+
+	if status == "failed" && currentSize == 0 {
+		return s.writeDownloadError(w, file.FileHash)
+	}
+	if ct != "" {
+		file.ContentType = ct
+		file.FileSize = fs
 	}
 
 	// Set headers for streaming
